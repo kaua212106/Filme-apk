@@ -9,12 +9,14 @@ import android.widget.TextView;
 public final class Ui {
     public static final int BG = Color.rgb(246, 247, 253);
     public static final int TEXT = Color.rgb(31, 38, 58);
-    public static final int MUTED = Color.rgb(104, 112, 134);
-    public static final int BORDER = Color.rgb(228, 231, 242);
-    public static final int PURPLE = Color.rgb(108, 99, 231);
+    public static final int MUTED = Color.rgb(110, 116, 136);
+    public static final int BORDER = Color.rgb(234, 235, 244);
+    public static final int PURPLE = Color.rgb(104, 91, 214);
     public static final int BLUE = Color.rgb(102, 126, 234);
+    public static final int DEEP_PURPLE = Color.rgb(83, 75, 175);
     public static final int NAVY = Color.rgb(20, 27, 48);
     public static final int GREEN = Color.rgb(44, 177, 126);
+    public static final int SOFT = Color.rgb(248, 248, 252);
 
     private Ui() {}
 
@@ -40,10 +42,27 @@ public final class Ui {
         return d;
     }
 
+    public static GradientDrawable screenGradient(Context c) {
+        GradientDrawable d = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                new int[]{Color.rgb(103,128,236), Color.rgb(105,91,214), Color.rgb(119,73,161)}
+        );
+        d.setGradientType(GradientDrawable.LINEAR_GRADIENT);
+        return d;
+    }
+
+    public static GradientDrawable topBarGradient(Context c) {
+        GradientDrawable d = new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{Color.rgb(86,84,176), Color.rgb(89,78,166)}
+        );
+        return d;
+    }
+
     public static GradientDrawable softGradient(Context c, float radiusDp) {
         GradientDrawable d = new GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                new int[]{Color.rgb(244,242,255), Color.rgb(235,241,255)}
+                new int[]{Color.rgb(245,243,255), Color.rgb(237,241,255)}
         );
         d.setCornerRadius(dp(c, radiusDp));
         return d;
