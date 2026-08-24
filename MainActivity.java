@@ -502,6 +502,14 @@ public class MainActivity extends Activity {
         catalog.setOnClickListener(v -> pickCatalogFolder());
         pageContent.addView(catalog);
 
+        int capturedNames = OriginalAppBridge.getCapturedTitleCount(this);
+        String identifySubtitle = capturedNames > 0
+                ? capturedNames + " nome(s) capturado(s) • pronto para associar aos arquivos"
+                : "Sem root • usa somente a tela de Downloads do app original";
+        LinearLayout identify = settingsCard("✨", "Identificar nomes automaticamente", identifySubtitle);
+        identify.setOnClickListener(v -> showOriginalTitleTools());
+        pageContent.addView(identify);
+
         LinearLayout fav = settingsCard("★", "Favoritos", "Abrir todos os filmes que você marcou com estrela");
         fav.setOnClickListener(v -> setPage("favorites"));
         pageContent.addView(fav);
@@ -953,6 +961,178 @@ public class MainActivity extends Activity {
         } else if (requestCode == REQ_COVER && pendingCoverMovie != null) {
             copyCover(uri, pendingCoverMovie);
         }
+    }
+
+    private void showOriginalTitleTools() {
+        boolean installed = OriginalAppBridge.isOriginalAppInstalled(this);
+        boolean accessibility = OriginalAppBridge.isAccessibilityEnabled(this);
+        int captured = OriginalAppBridge.getCapturedTitleCount(this);
+        boolean finished = OriginalAppBridge.isCaptureFinished(this);
+
+        StringBuilder status = new StringBuilder();
+        status.append("Esse modo não usa root e não acessa /data/user/0. ")
+                .append("O Cine Offline lê somente os nomes que aparecem na lista de Downloads do app original e liga cada nome ao código da pasta do vídeo.\n\n");
+        status.append("App original: ").append(installed ? "✅ instalado" : "❌ não encontrado").append('\n');
+        status.append("Acessibilidade do Cine Offline: ").append(accessibility ? "✅ ativada" : "❌ desativada").append('\n');
+        status.append("Nomes capturados: ").append(captured);
+        if (finished && captured > 0) status.append(" ✅");
+        status.append("\n\nPara séries, o nome exibido pelo app original é mantido, inclusive temporada/episódio quando ele mostrar essa informação.");
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("✨ Identificar títulos sem root")
+                .setMessage(status.toString())
+                .setNegativeButton("Fechar", null)
+                .create();
+
+        if (!installed) {
+            dialog.setButton(AlertDialog.BUTTON_POSITIVE, "OK", (d, w) -> d.dismiss());
+        } else if (!accessibility) {
+            dialog.setButton(AlertDialog.BUTTON_POSITIVE, "Ativar acessibilidade", (d, w) -> {
+                d.dismiss();
+                new AlertDialog.Builder(this)
+                        .setTitle("Ativar somente para o app original")
+                        .setMessage("Na tela de Acessibilidade, procure Cine Offline e ative o serviço de identificação. Ele foi limitado ao pacote do app original e não lê outros aplicativos.\n\nDepois volte ao Cine Offline e toque novamente em “Identificar nomes automaticamente”.")
+                        .setNegativeButton("Cancelar", null)
+                        .setPositiveButton("Abrir Acessibilidade", (x, y) -> OriginalAppBridge.openAccessibilitySettings(this))
+                        .show();
+            });
+        } else if (captured <= 0) {
+            dialog.setButton(AlertDialog.BUTTON_POSITIVE, "Capturar nomes", (d, w) -> {
+                d.dismiss();
+                explainAndStartOriginalCapture();
+            });
+            dialog.setButton(AlertDialog.BUTTON_NEUTRAL, "Limpar", (d, w) -> {
+                OriginalAppBridge.clearCapture(this);
+                Toast.makeText(this, "Captura limpa.", Toast.LENGTH_SHORT).show();
+            });
+        } else {
+            dialog.setButton(AlertDialog.BUTTON_POSITIVE, "Aplicar nomes", (d, w) -> {
+                d.dismiss();
+                applyOriginalCapturedNames();
+            });
+            dialog.setButton(AlertDialog.BUTTON_NEUTRAL, "Capturar de novo", (d, w) -> {
+                d.dismiss();
+                explainAndStartOriginalCapture();
+            });
+        }
+
+        dialog.setOnShowListener(d -> {
+            if (!installed) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("OK");
+            } else if (!accessibility) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Ativar acessibilidade");
+            } else if (captured <= 0) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Capturar nomes");
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setText("Limpar");
+            } else {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Aplicar nomes");
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setText("Capturar de novo");
+            }
+        });
+        dialog.show();
+
+        // AlertDialog cria os botões apenas depois de show(). Reaplica as ações aqui para
+        // funcionar da mesma forma em todas as versões do Android.
+        if (!installed) {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> dialog.dismiss());
+        } else if (!accessibility) {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                dialog.dismiss();
+                new AlertDialog.Builder(this)
+                        .setTitle("Ativar somente para o app original")
+                        .setMessage("Na tela de Acessibilidade, procure Cine Offline e ative o serviço de identificação. Ele foi limitado ao app original e não lê outros aplicativos.\n\nDepois volte ao Cine Offline e toque novamente em “Identificar nomes automaticamente”.")
+                        .setNegativeButton("Cancelar", null)
+                        .setPositiveButton("Abrir Acessibilidade", (x, y) -> OriginalAppBridge.openAccessibilitySettings(this))
+                        .show();
+            });
+        } else if (captured <= 0) {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                dialog.dismiss();
+                explainAndStartOriginalCapture();
+            });
+        } else {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                dialog.dismiss();
+                applyOriginalCapturedNames();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                dialog.dismiss();
+                explainAndStartOriginalCapture();
+            });
+        }
+    }
+
+    private void explainAndStartOriginalCapture() {
+        new AlertDialog.Builder(this)
+                .setTitle("Capturar nomes")
+                .setMessage("Vou abrir o app original.\n\n1. Entre em Downloads.\n2. Abra a aba/lista de downloads concluídos.\n3. Deixe a lista no topo.\n4. Não precisa rolar: o Cine Offline vai rolar a lista sozinho.\n\nQuando aparecer “Captura concluída”, volte ao Cine Offline sem forçar o fechamento do app original.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Abrir app original", (d, w) -> {
+                    OriginalAppBridge.beginCapture(this);
+                    if (!OriginalAppBridge.openOriginalApp(this)) {
+                        Toast.makeText(this, "Não consegui abrir o app original.", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    Toast.makeText(this, "Abra Downloads > Concluídos e deixe a lista no topo.", Toast.LENGTH_LONG).show();
+                })
+                .show();
+    }
+
+    private void applyOriginalCapturedNames() {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(24), dp(22), dp(24), dp(16));
+
+        ProgressBar spinner = new ProgressBar(this);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
+        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        TextView message = text("Preparando identificação…", 13, false, Ui.MUTED);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, dp(14), 0, 0);
+        content.addView(message);
+
+        AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("Identificando filmes e séries")
+                .setView(content)
+                .setCancelable(false)
+                .create();
+        progress.show();
+
+        executor.execute(() -> {
+            OriginalAppBridge.IdentificationResult result = OriginalAppBridge.identifyAndRename(
+                    getApplicationContext(), repo,
+                    txt -> runOnUiThread(() -> { if (!isFinishing()) message.setText(txt); })
+            );
+            runOnUiThread(() -> {
+                if (!isFinishing()) progress.dismiss();
+                if (!result.ok) {
+                    new AlertDialog.Builder(this)
+                            .setTitle("Não foi possível identificar")
+                            .setMessage(result.error)
+                            .setNegativeButton("Fechar", null)
+                            .setPositiveButton("Abrir app original", (d, w) -> OriginalAppBridge.openOriginalApp(this))
+                            .show();
+                    return;
+                }
+
+                renderPage();
+                StringBuilder msg = new StringBuilder();
+                msg.append("✅ ").append(result.renamed).append(" título(s) atualizado(s).\n")
+                        .append("• ").append(result.capturedTitles).append(" nomes capturados\n")
+                        .append("• ").append(result.completedDownloads).append(" downloads concluídos encontrados\n")
+                        .append("• ").append(result.movieIdsFound).append(" itens da biblioteca com código reconhecido");
+                if (result.notMatched > 0) msg.append("\n• ").append(result.notMatched).append(" item(ns) sem associação");
+                if (result.warning != null && !result.warning.isEmpty()) msg.append("\n\n⚠ ").append(result.warning);
+
+                new AlertDialog.Builder(this)
+                        .setTitle("Identificação concluída")
+                        .setMessage(msg.toString())
+                        .setPositiveButton("OK", null)
+                        .show();
+            });
+        });
     }
 
     private void pickCatalogFolder() {
