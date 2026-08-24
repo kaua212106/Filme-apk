@@ -9,6 +9,7 @@ import android.provider.OpenableColumns;
 
 import androidx.documentfile.provider.DocumentFile;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
@@ -27,6 +28,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -155,7 +158,7 @@ public class MovieImporter {
             listener.onProgress("🎬 Adicionando " + current + " de " + total + ": " + title);
 
             ImportResult result = importFolderLinkedDocument(
-                    context, folder, title, treeUri.toString(),
+                    context, folder, title, folder.getUri().toString(),
                     text -> listener.onProgress("🎬 " + current + "/" + total + " • " + text)
             );
             if (result.ok) {
@@ -240,25 +243,39 @@ public class MovieImporter {
     }
 
     private static String guessMovieTitle(Context context, DocumentFile folder, int index) {
+        // 1) Primeiro tenta arquivos de metadados (JSON/TXT/NFO/XML etc.).
         String metadataTitle = findMetadataTitle(context, folder, 0);
-        if (metadataTitle != null && !metadataTitle.trim().isEmpty()) {
-            return cleanTitle(metadataTitle);
-        }
+        if (isUsefulTitle(metadataTitle)) return cleanTitle(metadataTitle);
 
+        // 2) Algumas playlists guardam o nome do conteúdo em tags próprias.
+        String playlistTitle = findTitleInPlaylist(context, folder, 0);
+        if (isUsefulTitle(playlistTitle)) return cleanTitle(playlistTitle);
+
+        // 3) Tenta ler o título embutido no próprio vídeo/segmento HLS.
+        String embeddedTitle = findEmbeddedMediaTitle(context, folder, 0, new int[]{0});
+        if (isUsefulTitle(embeddedTitle)) return cleanTitle(embeddedTitle);
+
+        // 4) Se algum arquivo tiver um nome legível, usa esse nome.
+        String mediaFileTitle = findMeaningfulMediaFileName(folder, 0);
+        if (isUsefulTitle(mediaFileTitle)) return cleanTitle(mediaFileTitle);
+
+        // 5) Por último usa o nome da pasta, mas ignora os hashes hexadecimais.
         String folderName = folder.getName();
         if (folderName != null) {
             String trimmed = folderName.trim();
-            // Pastas como 0C7DC2A47234F8E971C5E9E345F725FF não são úteis como título.
             if (!trimmed.matches("(?i)[0-9a-f]{16,}")) return cleanTitle(trimmed);
         }
+
+        // Se realmente não existe nenhum nome/metadado, mantém um nome provisório.
         return String.format(Locale.getDefault(), "Filme %02d", index);
     }
 
     private static String findMetadataTitle(Context context, DocumentFile folder, int depth) {
-        if (depth > 3) return null;
+        if (depth > 4) return null;
         DocumentFile[] files;
         try { files = folder.listFiles(); } catch (Exception e) { return null; }
 
+        // Arquivos que normalmente guardam o nome diretamente.
         for (DocumentFile item : files) {
             if (item.isDirectory()) continue;
             String name = item.getName();
@@ -266,18 +283,34 @@ public class MovieImporter {
             String lower = name.toLowerCase(Locale.ROOT);
 
             try {
-                if (lower.equals("title.txt") || lower.equals("name.txt") || lower.equals("movie.txt")) {
-                    String raw = readLimitedText(context, item.getUri(), 4096);
-                    if (raw != null && !raw.trim().isEmpty()) return raw.trim();
+                if (lower.equals("title.txt") || lower.equals("name.txt") || lower.equals("movie.txt") ||
+                        lower.equals("video.txt") || lower.equals("titulo.txt")) {
+                    String raw = readLimitedText(context, item.getUri(), 16 * 1024);
+                    String direct = firstUsefulLine(raw);
+                    if (isUsefulTitle(direct)) return direct;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Procura em qualquer JSON pequeno, mesmo que o arquivo tenha nome aleatório.
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) continue;
+            String name = item.getName();
+            if (name == null) continue;
+            String lower = name.toLowerCase(Locale.ROOT);
+
+            try {
+                if (lower.endsWith(".json")) {
+                    String raw = readLimitedText(context, item.getUri(), 512 * 1024);
+                    String title = titleFromJson(raw);
+                    if (isUsefulTitle(title)) return title;
                 }
 
-                boolean likelyMetadata = lower.endsWith(".json") &&
-                        (lower.contains("meta") || lower.contains("info") || lower.contains("movie") ||
-                                lower.contains("video") || lower.contains("detail"));
-                if (likelyMetadata) {
+                if (lower.endsWith(".nfo") || lower.endsWith(".xml") || lower.endsWith(".meta") ||
+                        lower.endsWith(".info") || lower.endsWith(".cfg") || lower.endsWith(".conf")) {
                     String raw = readLimitedText(context, item.getUri(), 128 * 1024);
-                    String title = titleFromJson(raw);
-                    if (title != null && !title.trim().isEmpty()) return title.trim();
+                    String title = titleFromLooseText(raw);
+                    if (isUsefulTitle(title)) return title;
                 }
             } catch (Exception ignored) {}
         }
@@ -285,7 +318,7 @@ public class MovieImporter {
         for (DocumentFile item : files) {
             if (item.isDirectory()) {
                 String found = findMetadataTitle(context, item, depth + 1);
-                if (found != null && !found.trim().isEmpty()) return found;
+                if (isUsefulTitle(found)) return found;
             }
         }
         return null;
@@ -294,23 +327,206 @@ public class MovieImporter {
     private static String titleFromJson(String raw) {
         if (raw == null || raw.trim().isEmpty()) return null;
         try {
-            JSONObject o = new JSONObject(raw);
-            String[] keys = {"title", "movieTitle", "videoTitle", "original_title", "originalTitle", "name"};
-            for (String key : keys) {
-                String value = o.optString(key, "").trim();
-                if (!value.isEmpty()) return value;
+            Object root;
+            String t = raw.trim();
+            if (t.startsWith("[")) root = new JSONArray(t);
+            else root = new JSONObject(t);
+            return titleFromJsonValue(root, 0);
+        } catch (Exception ignored) {}
+        return titleFromLooseText(raw);
+    }
+
+    private static String titleFromJsonValue(Object value, int depth) {
+        if (value == null || depth > 8) return null;
+
+        if (value instanceof JSONObject) {
+            JSONObject o = (JSONObject) value;
+
+            String[] strongKeys = {
+                    "movieTitle", "videoTitle", "contentTitle", "mediaTitle",
+                    "original_title", "originalTitle", "displayTitle", "titulo", "title"
+            };
+            for (String key : strongKeys) {
+                String v = o.optString(key, "").trim();
+                if (isUsefulTitle(v)) return v;
             }
-            String[] nestedKeys = {"movie", "video", "data", "info", "metadata"};
-            for (String nested : nestedKeys) {
-                JSONObject n = o.optJSONObject(nested);
-                if (n == null) continue;
-                for (String key : keys) {
-                    String value = n.optString(key, "").trim();
-                    if (!value.isEmpty()) return value;
+
+            String typeHint = (
+                    o.optString("type", "") + " " +
+                    o.optString("mediaType", "") + " " +
+                    o.optString("contentType", "") + " " +
+                    o.optString("kind", "")
+            ).toLowerCase(Locale.ROOT);
+            if (typeHint.contains("movie") || typeHint.contains("film") || typeHint.contains("video") ||
+                    typeHint.contains("vod") || typeHint.contains("content")) {
+                String name = o.optString("name", "").trim();
+                if (isUsefulTitle(name)) return name;
+            }
+
+            java.util.Iterator<String> keys = o.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                Object child = o.opt(key);
+                if (child instanceof JSONObject || child instanceof JSONArray) {
+                    String found = titleFromJsonValue(child, depth + 1);
+                    if (isUsefulTitle(found)) return found;
                 }
             }
-        } catch (Exception ignored) {}
+        } else if (value instanceof JSONArray) {
+            JSONArray a = (JSONArray) value;
+            int limit = Math.min(a.length(), 50);
+            for (int i = 0; i < limit; i++) {
+                String found = titleFromJsonValue(a.opt(i), depth + 1);
+                if (isUsefulTitle(found)) return found;
+            }
+        }
         return null;
+    }
+
+    private static String titleFromLooseText(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return null;
+
+        Pattern[] patterns = new Pattern[] {
+                Pattern.compile("(?is)<(?:title|movieTitle|videoTitle|contentTitle|titulo)>\\s*([^<]{1,160})\\s*</(?:title|movieTitle|videoTitle|contentTitle|titulo)>"),
+                Pattern.compile("(?im)^\\s*(?:title|movieTitle|videoTitle|contentTitle|mediaTitle|originalTitle|titulo)\\s*[:=]\\s*[\\\"']?([^\\\"'\\r\\n]{1,160})"),
+                Pattern.compile("(?is)[\\\"'](?:title|movieTitle|videoTitle|contentTitle|mediaTitle|original_title|originalTitle|titulo)[\\\"']\\s*:\\s*[\\\"']([^\\\"']{1,160})[\\\"']")
+        };
+
+        for (Pattern p : patterns) {
+            Matcher m = p.matcher(raw);
+            if (m.find()) {
+                String value = m.group(1).trim();
+                if (isUsefulTitle(value)) return value;
+            }
+        }
+        return null;
+    }
+
+    private static String findTitleInPlaylist(Context context, DocumentFile folder, int depth) {
+        if (depth > 4) return null;
+        DocumentFile[] files;
+        try { files = folder.listFiles(); } catch (Exception e) { return null; }
+
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) continue;
+            String name = item.getName();
+            if (name == null || !name.toLowerCase(Locale.ROOT).endsWith(".m3u8")) continue;
+            try {
+                String raw = readLimitedText(context, item.getUri(), 256 * 1024);
+                if (raw == null) continue;
+
+                Pattern[] patterns = new Pattern[] {
+                        Pattern.compile("(?im)^#.*(?:MOVIE-TITLE|VIDEO-TITLE|CONTENT-TITLE|TITLE)\\s*[:=]\\s*[\\\"']?([^\\\"'\\r\\n,]{2,160})"),
+                        Pattern.compile("(?im)^#EXT-X-SESSION-DATA:.*DATA-ID=[\\\"'][^\\\"']*title[^\\\"']*[\\\"'].*VALUE=[\\\"']([^\\\"']{2,160})[\\\"']")
+                };
+                for (Pattern p : patterns) {
+                    Matcher m = p.matcher(raw);
+                    if (m.find() && isUsefulTitle(m.group(1))) return m.group(1).trim();
+                }
+            } catch (Exception ignored) {}
+        }
+
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) {
+                String found = findTitleInPlaylist(context, item, depth + 1);
+                if (isUsefulTitle(found)) return found;
+            }
+        }
+        return null;
+    }
+
+    private static String findEmbeddedMediaTitle(Context context, DocumentFile folder, int depth, int[] checked) {
+        if (depth > 4 || checked[0] >= 5) return null;
+        DocumentFile[] files;
+        try { files = folder.listFiles(); } catch (Exception e) { return null; }
+
+        for (int pass = 0; pass < 2 && checked[0] < 5; pass++) {
+            for (DocumentFile item : files) {
+                if (item.isDirectory()) continue;
+                String name = item.getName();
+                if (name == null) continue;
+                String lower = name.toLowerCase(Locale.ROOT);
+                boolean fullVideo = lower.endsWith(".mp4") || lower.endsWith(".mkv") ||
+                        lower.endsWith(".webm") || lower.endsWith(".mov") || lower.endsWith(".m4v");
+                boolean segment = lower.endsWith(".ts") || lower.endsWith(".dat");
+                if ((pass == 0 && !fullVideo) || (pass == 1 && !segment)) continue;
+
+                checked[0]++;
+                MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+                try {
+                    retriever.setDataSource(context, item.getUri());
+                    String title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE);
+                    if (isUsefulTitle(title)) return title.trim();
+                } catch (Exception ignored) {
+                } finally {
+                    try { retriever.release(); } catch (Exception ignored) {}
+                }
+                if (checked[0] >= 5) break;
+            }
+        }
+
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) {
+                String found = findEmbeddedMediaTitle(context, item, depth + 1, checked);
+                if (isUsefulTitle(found)) return found;
+                if (checked[0] >= 5) break;
+            }
+        }
+        return null;
+    }
+
+    private static String findMeaningfulMediaFileName(DocumentFile folder, int depth) {
+        if (depth > 4) return null;
+        DocumentFile[] files;
+        try { files = folder.listFiles(); } catch (Exception e) { return null; }
+
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) continue;
+            String name = item.getName();
+            if (name == null) continue;
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (!(lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".webm") ||
+                    lower.endsWith(".mov") || lower.endsWith(".m4v"))) continue;
+
+            String base = name.replaceFirst("(?i)\\.(mp4|mkv|webm|mov|m4v)$", "").trim();
+            if (isUsefulTitle(base) && !looksLikeGeneratedFileName(base)) return base;
+        }
+
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) {
+                String found = findMeaningfulMediaFileName(item, depth + 1);
+                if (isUsefulTitle(found)) return found;
+            }
+        }
+        return null;
+    }
+
+    private static String firstUsefulLine(String raw) {
+        if (raw == null) return null;
+        for (String line : raw.replace("\r", "").split("\n")) {
+            String s = line.trim();
+            if (isUsefulTitle(s)) return s;
+        }
+        return null;
+    }
+
+    private static boolean looksLikeGeneratedFileName(String value) {
+        if (value == null) return true;
+        String s = value.trim();
+        return s.matches("(?i)[0-9a-f]{12,}") ||
+                s.matches("\\d{1,8}") ||
+                s.matches("(?i)(segment|part|chunk|video|movie|file|index)[-_ ]?\\d*");
+    }
+
+    private static boolean isUsefulTitle(String value) {
+        if (value == null) return false;
+        String s = value.trim();
+        if (s.length() < 2 || s.length() > 180) return false;
+        if (s.matches("(?i)[0-9a-f]{16,}")) return false;
+        if (s.matches("\\d+")) return false;
+        String low = s.toLowerCase(Locale.ROOT);
+        return !low.equals("video") && !low.equals("movie") && !low.equals("filme") &&
+                !low.equals("unknown") && !low.equals("untitled") && !low.equals("null");
     }
 
     private static String readLimitedText(Context context, Uri uri, int maxBytes) throws Exception {
