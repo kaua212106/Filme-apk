@@ -572,6 +572,16 @@ public class MainActivity extends Activity {
         createSeries.setOnClickListener(v -> showCreateSeriesDialog());
         pageContent.addView(createSeries);
 
+        int capturedNames = OriginalAppBridge.getCapturedTitleCount(this);
+        int savedNames = OriginalAppBridge.getSavedMappingCount(this);
+        String captureSub = savedNames > 0
+                ? savedNames + " nome(s) já salvos • pode apagar do app original depois de associar"
+                : (capturedNames > 0 ? capturedNames + " nome(s) capturado(s) • falta associar e salvar"
+                : "Abre o app original em Downloads e captura os nomes sem root");
+        LinearLayout capture = settingsCard("↗", "Pegar nomes do app original", captureSub);
+        capture.setOnClickListener(v -> showOriginalTitleTools());
+        pageContent.addView(capture);
+
         LinearLayout backup = settingsCard("⇩", "Exportar backup da organização", "Salva nomes, séries, episódios, favoritos e progresso em um JSON pequeno");
         backup.setOnClickListener(v -> createBackupDocument());
         pageContent.addView(backup);
@@ -596,10 +606,165 @@ public class MainActivity extends Activity {
         lp.setMargins(0, 0, 0, dp(12));
         info.setLayoutParams(lp);
         info.addView(text("100% offline", 17, true, Ui.TEXT));
-        TextView sub = text("O Cine Offline não tenta mais identificar títulos automaticamente. Você pode renomear os itens, organizar episódios manualmente em séries e exportar um backup da organização antes de desinstalar o app.", 12, false, Ui.MUTED);
+        TextView sub = text("O Cine Offline pode copiar os nomes que aparecem nos Downloads do app original. Depois que a associação código → nome for salva, você pode apagar os downloads do app original sem perder os nomes. O backup da organização também leva essas associações.", 12, false, Ui.MUTED);
         sub.setPadding(0, dp(7), 0, 0);
         info.addView(sub);
         pageContent.addView(info);
+    }
+
+    private void showOriginalTitleTools() {
+        boolean installed = OriginalAppBridge.isOriginalAppInstalled(this);
+        boolean accessibility = OriginalAppBridge.isAccessibilityEnabled(this);
+        int captured = OriginalAppBridge.getCapturedTitleCount(this);
+        int saved = OriginalAppBridge.getSavedMappingCount(this);
+        boolean finished = OriginalAppBridge.isCaptureFinished(this);
+
+        StringBuilder status = new StringBuilder();
+        status.append("Esse método usa somente a tela de Downloads do app original e não precisa de root.\n\n");
+        status.append("App original: ").append(installed ? "✅ instalado" : "❌ não encontrado").append('\n');
+        status.append("Acessibilidade: ").append(accessibility ? "✅ ativada" : "❌ desativada").append('\n');
+        status.append("Captura atual: ").append(captured).append(" nome(s)");
+        if (finished && captured > 0) status.append(" ✅");
+        status.append('\n').append("Associações salvas: ").append(saved).append(" nome(s)");
+        status.append("\n\nDepois de associar e salvar, você pode remover os downloads do app original. Os nomes continuam guardados no Cine Offline e também entram no backup da organização.");
+
+        ArrayList<String> options = new ArrayList<>();
+        ArrayList<Integer> actions = new ArrayList<>();
+        if (!accessibility) {
+            options.add("Ativar acessibilidade do Cine Offline"); actions.add(1);
+        }
+        if (installed && accessibility) {
+            options.add("Capturar nomes nos Downloads"); actions.add(2);
+        }
+        if (captured > 0) {
+            options.add("Associar captura aos arquivos e salvar"); actions.add(3);
+        }
+        if (saved > 0) {
+            options.add("Aplicar nomes já salvos à biblioteca"); actions.add(4);
+        }
+        if (captured > 0) {
+            options.add("Limpar somente a captura atual"); actions.add(5);
+        }
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle("Pegar nomes do app original")
+                .setMessage(status.toString())
+                .setNegativeButton("Fechar", null);
+        if (options.isEmpty()) {
+            b.setPositiveButton("OK", null).show();
+            return;
+        }
+        b.setItems(options.toArray(new String[0]), (d, which) -> {
+            int action = actions.get(which);
+            if (action == 1) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Ativar acessibilidade")
+                        .setMessage("Na tela de Acessibilidade, procure Cine Offline e ative o serviço de captura de títulos. Ele é limitado ao pacote do app original. Depois volte ao Cine Offline.")
+                        .setNegativeButton("Cancelar", null)
+                        .setPositiveButton("Abrir Acessibilidade", (x, y) -> OriginalAppBridge.openAccessibilitySettings(this))
+                        .show();
+            } else if (action == 2) {
+                explainAndStartOriginalCapture();
+            } else if (action == 3) {
+                applyOriginalCapturedNames();
+            } else if (action == 4) {
+                applySavedOriginalNames();
+            } else if (action == 5) {
+                OriginalAppBridge.clearCapture(this);
+                Toast.makeText(this, "Captura atual apagada. Os nomes já salvos foram mantidos.", Toast.LENGTH_LONG).show();
+                renderPage();
+            }
+        }).show();
+    }
+
+    private void explainAndStartOriginalCapture() {
+        new AlertDialog.Builder(this)
+                .setTitle("Capturar nomes")
+                .setMessage("Vou abrir o app onde você baixou os filmes.\n\n1. Entre em Downloads.\n2. Abra a lista de downloads concluídos.\n3. Deixe a lista no topo.\n4. O Cine Offline vai ler os nomes e rolar a lista automaticamente.\n\nIMPORTANTE: ainda não apague esses downloads. Primeiro volte ao Cine Offline e use ‘Associar captura aos arquivos e salvar’. Depois disso pode apagar do app original.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Abrir app original", (d, w) -> {
+                    OriginalAppBridge.beginCapture(this);
+                    if (!OriginalAppBridge.openOriginalApp(this)) {
+                        Toast.makeText(this, "Não consegui abrir o app original.", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    Toast.makeText(this, "Abra Downloads > Concluídos e deixe a lista no topo.", Toast.LENGTH_LONG).show();
+                })
+                .show();
+    }
+
+    private void applyOriginalCapturedNames() {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(24), dp(22), dp(24), dp(16));
+
+        ProgressBar spinner = new ProgressBar(this);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
+        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        TextView message = text("Associando nomes aos códigos dos downloads…", 13, false, Ui.MUTED);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, dp(14), 0, 0);
+        content.addView(message);
+
+        AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("Salvando identificação")
+                .setView(content)
+                .setCancelable(false)
+                .create();
+        progress.show();
+
+        executor.execute(() -> {
+            OriginalAppBridge.IdentificationResult result = OriginalAppBridge.identifyAndRename(
+                    getApplicationContext(), repo,
+                    txt -> runOnUiThread(() -> { if (!isFinishing()) message.setText(txt); })
+            );
+            runOnUiThread(() -> {
+                if (!isFinishing()) progress.dismiss();
+                if (!result.ok) {
+                    new AlertDialog.Builder(this)
+                            .setTitle("Não foi possível associar")
+                            .setMessage(result.error + "\n\nDeixe o app original aberto na tela de Downloads e tente novamente antes de apagar os downloads.")
+                            .setNegativeButton("Fechar", null)
+                            .setPositiveButton("Abrir app original", (d, w) -> OriginalAppBridge.openOriginalApp(this))
+                            .show();
+                    return;
+                }
+
+                renderPage();
+                int saved = OriginalAppBridge.getSavedMappingCount(this);
+                StringBuilder msg = new StringBuilder();
+                msg.append("✅ ").append(result.renamed).append(" título(s) atualizado(s).\n")
+                        .append("• ").append(result.capturedTitles).append(" nomes capturados\n")
+                        .append("• ").append(result.completedDownloads).append(" downloads associados\n")
+                        .append("• ").append(saved).append(" associação(ões) guardada(s) no celular");
+                if (result.notMatched > 0) msg.append("\n• ").append(result.notMatched).append(" item(ns) da biblioteca ainda sem associação");
+                msg.append("\n\nAgora você pode apagar esses downloads do app original. Para se proteger caso desinstale o Cine Offline, use também ‘Exportar backup da organização’. ");
+
+                new AlertDialog.Builder(this)
+                        .setTitle("Nomes salvos")
+                        .setMessage(msg.toString())
+                        .setPositiveButton("OK", null)
+                        .show();
+            });
+        });
+    }
+
+    private void applySavedOriginalNames() {
+        OriginalAppBridge.IdentificationResult result = OriginalAppBridge.applySavedMappings(this, repo);
+        if (!result.ok) {
+            Toast.makeText(this, result.error, Toast.LENGTH_LONG).show();
+            return;
+        }
+        renderPage();
+        new AlertDialog.Builder(this)
+                .setTitle("Nomes salvos aplicados")
+                .setMessage(result.renamed + " título(s) atualizado(s).\n" +
+                        result.unchanged + " já estavam corretos.\n" +
+                        result.notMatched + " item(ns) não tinham uma associação salva.")
+                .setPositiveButton("OK", null)
+                .show();
     }
 
     private LinearLayout settingsCard(String icon, String title, String subtitle) {
@@ -1573,6 +1738,9 @@ public class MainActivity extends Activity {
             }
             root.put("assignments", assignments);
 
+            // Também guarda a relação estável código da pasta -> nome capturado no app original.
+            root.put("originalMappings", OriginalAppBridge.exportSavedMappings(this));
+
             try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
                 if (out == null) throw new Exception("Não foi possível abrir o arquivo de destino.");
                 out.write(root.toString(2).getBytes(StandardCharsets.UTF_8));
@@ -1605,6 +1773,7 @@ public class MainActivity extends Activity {
     }
 
     private void restoreBackup(JSONObject root) throws Exception {
+        int restoredOriginalMappings = OriginalAppBridge.importSavedMappings(this, root.optJSONObject("originalMappings"));
         List<Movie> current = repo.getAll();
         Map<String, Movie> currentByKey = new HashMap<>();
         Map<Long, List<Movie>> currentByDuration = new HashMap<>();
@@ -1688,7 +1857,8 @@ public class MainActivity extends Activity {
                 .setTitle("Backup restaurado")
                 .setMessage(restoredNames + " item(ns) tiveram nomes/dados restaurados.\n" +
                         newSeriesIds.size() + " série(s) recriada(s).\n" +
-                        restoredEpisodes + " episódio(s) reorganizado(s).")
+                        restoredEpisodes + " episódio(s) reorganizado(s).\n" +
+                        restoredOriginalMappings + " associação(ões) do app original restaurada(s).")
                 .setPositiveButton("OK", null)
                 .show();
     }

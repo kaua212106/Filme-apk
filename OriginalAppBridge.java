@@ -44,6 +44,7 @@ public final class OriginalAppBridge {
     public static final String ORIGINAL_PACKAGE = "com.starshort.minishort";
     private static final String PREF = "cine_original_bridge";
     private static final String KEY_PORT = "last_port";
+    private static final String KEY_SAVED_MAP = "saved_resource_title_map";
     private static final Pattern RESOURCE_PATTERN = Pattern.compile("(?i)(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])");
 
     private OriginalAppBridge() {}
@@ -84,10 +85,7 @@ public final class OriginalAppBridge {
         try {
             PackageManager pm = context.getPackageManager();
             Intent i = pm.getLaunchIntentForPackage(ORIGINAL_PACKAGE);
-            if (i == null) {
-                i = new Intent();
-                i.setClassName(ORIGINAL_PACKAGE, "com.mgs.carparking.ui.MainActivity");
-            }
+            if (i == null) return false;
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
             context.startActivity(i);
             return true;
@@ -114,6 +112,74 @@ public final class OriginalAppBridge {
 
     public static List<String> getCapturedTitles(Context context) {
         return OriginalTitleAccessibilityService.getCapturedTitles(context.getApplicationContext());
+    }
+
+    /** Relações código da pasta -> título já confirmadas. Ficam salvas mesmo após apagar o download do app original. */
+    public static Map<String, String> getSavedMappings(Context context) {
+        Map<String, String> out = new HashMap<>();
+        String raw = context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(KEY_SAVED_MAP, "{}");
+        try {
+            JSONObject o = new JSONObject(raw == null ? "{}" : raw);
+            JSONArray names = o.names();
+            if (names != null) {
+                for (int i = 0; i < names.length(); i++) {
+                    String key = normalizeResource(names.optString(i, ""));
+                    String title = cleanCapturedTitle(o.optString(names.optString(i, ""), ""));
+                    if (!key.isEmpty() && !title.isEmpty()) out.put(key, title);
+                }
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
+    public static int getSavedMappingCount(Context context) {
+        return getSavedMappings(context).size();
+    }
+
+    private static void saveMappings(Context context, Map<String, String> incoming) {
+        Map<String, String> merged = getSavedMappings(context);
+        if (incoming != null) {
+            for (Map.Entry<String, String> e : incoming.entrySet()) {
+                String key = normalizeResource(e.getKey());
+                String title = cleanCapturedTitle(e.getValue());
+                if (!key.isEmpty() && !title.isEmpty()) merged.put(key, title);
+            }
+        }
+        JSONObject o = new JSONObject();
+        try { for (Map.Entry<String, String> e : merged.entrySet()) o.put(e.getKey(), e.getValue()); }
+        catch (Exception ignored) {}
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+                .putString(KEY_SAVED_MAP, o.toString()).apply();
+    }
+
+    public static JSONObject exportSavedMappings(Context context) {
+        JSONObject o = new JSONObject();
+        try { for (Map.Entry<String, String> e : getSavedMappings(context).entrySet()) o.put(e.getKey(), e.getValue()); }
+        catch (Exception ignored) {}
+        return o;
+    }
+
+    public static int importSavedMappings(Context context, JSONObject object) {
+        if (object == null) return 0;
+        Map<String, String> incoming = new HashMap<>();
+        JSONArray names = object.names();
+        if (names != null) {
+            for (int i = 0; i < names.length(); i++) {
+                String rawKey = names.optString(i, "");
+                String key = normalizeResource(rawKey);
+                String title = cleanCapturedTitle(object.optString(rawKey, ""));
+                if (!key.isEmpty() && !title.isEmpty()) incoming.put(key, title);
+            }
+        }
+        saveMappings(context, incoming);
+        return incoming.size();
+    }
+
+    public static IdentificationResult applySavedMappings(Context context, MovieRepository repo) {
+        Map<String, String> byResource = getSavedMappings(context);
+        if (byResource.isEmpty()) return IdentificationResult.fail("Nenhuma associação de nome foi salva ainda.");
+        return applyMappingsToLibrary(repo, byResource, 0, 0,
+                "Os nomes vieram da configuração salva no próprio Cine Offline.");
     }
 
     public static IdentificationResult identifyAndRename(Context context, MovieRepository repo,
@@ -156,23 +222,33 @@ public final class OriginalAppBridge {
             if (!resource.isEmpty() && !title.isEmpty()) byResource.put(resource, title);
         }
 
-        listener.onProgress("🎬 Associando nomes aos arquivos da biblioteca…");
+        // Salva a associação imediatamente. Depois disso, os downloads podem ser apagados do app original.
+        saveMappings(context, byResource);
+
+        listener.onProgress("💾 Associação salva no Cine Offline…");
+        return applyMappingsToLibrary(repo, byResource, titles.size(), completed.size(),
+                "As associações código → nome ficaram salvas no celular e entram no backup da organização.");
+    }
+
+    private static IdentificationResult applyMappingsToLibrary(MovieRepository repo, Map<String, String> byResource,
+                                                                 int capturedTitles, int completedDownloads,
+                                                                 String warning) {
         List<Movie> movies = repo.getAll();
         int renamed = 0;
         int foundIds = 0;
         int unchanged = 0;
-        ArrayList<String> missing = new ArrayList<>();
+        int notMatched = 0;
 
         for (Movie movie : movies) {
             String resource = extractResourceId(movie);
             if (resource.isEmpty()) {
-                missing.add(movie.title);
+                notMatched++;
                 continue;
             }
             foundIds++;
             String title = byResource.get(resource);
             if (title == null || title.isEmpty()) {
-                missing.add(movie.title);
+                notMatched++;
                 continue;
             }
             if (!title.equals(movie.title)) {
@@ -184,14 +260,13 @@ public final class OriginalAppBridge {
             }
         }
 
-        String warning = "";
-        if (foundIds == 0) {
+        if (foundIds == 0 && !movies.isEmpty()) {
             return IdentificationResult.fail("Os filmes atuais não guardam o código da pasta no índice offline. "
                     + "Remova-os e importe a pasta Filmes novamente no modo rápido, depois tente de novo.");
         }
 
         return new IdentificationResult(true, renamed, unchanged, movies.size(), foundIds,
-                titles.size(), completed.size(), missing.size(), warning, null);
+                capturedTitles, completedDownloads, notMatched, warning, null);
     }
 
     private static String cleanCapturedTitle(String s) {

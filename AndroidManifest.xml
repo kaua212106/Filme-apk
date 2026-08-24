@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Usada somente para confirmar pistas de título no Wikidata. -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <queries>
+        <package android:name="com.starshort.minishort" />
+    </queries>
 
     <application
         android:allowBackup="true"
@@ -10,7 +13,21 @@
         android:roundIcon="@drawable/icone"
         android:label="Cine Offline"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <service
+            android:name=".OriginalTitleAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="false"
+            android:label="Captura de títulos do Cine Offline">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/cine_title_accessibility" />
+        </service>
 
         <activity
             android:name=".PlayerActivity"
@@ -26,5 +43,4 @@
             </intent-filter>
         </activity>
     </application>
-
 </manifest>

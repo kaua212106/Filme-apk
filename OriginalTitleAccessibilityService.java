@@ -104,7 +104,8 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         }
 
         if (!isCaptureActive(this)) return;
-        if (!looksLikeDownloadScreen(lastActivity) && titles.isEmpty()) return;
+        // A captura só é iniciada manualmente pelo usuário e o serviço é limitado ao pacote
+        // do app original, então não dependemos do nome da Activity conter “download”.
         scheduleScan(240);
     }
 
