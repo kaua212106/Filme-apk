@@ -30,15 +30,22 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -46,6 +53,8 @@ public class MainActivity extends Activity {
     private static final int REQ_ZIP = 1001;
     private static final int REQ_FOLDER = 1002;
     private static final int REQ_COVER = 1003;
+    private static final int REQ_EXPORT_BACKUP = 1004;
+    private static final int REQ_IMPORT_BACKUP = 1005;
 
     private static final int IMPORT_ZIP = 0;
     private static final int IMPORT_FOLDER_LINKED = 1;
@@ -60,6 +69,7 @@ public class MainActivity extends Activity {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private TextView statMovies;
+    private TextView statSeries;
     private TextView statContinue;
     private TextView statFavorites;
     private EditText searchInput;
@@ -229,10 +239,14 @@ public class MainActivity extends Activity {
         List<Movie> continuing = new ArrayList<>();
         List<Movie> favorites = new ArrayList<>();
         List<Movie> recent = new ArrayList<>(all);
+        int movieCount = 0;
         for (Movie m : all) {
             if (isContinue(m)) continuing.add(m);
             if (m.favorite) favorites.add(m);
+            // Episódios organizados em uma série deixam de contar como filme avulso.
+            if (seriesRepo.getAssignment(m.id) == null) movieCount++;
         }
+        int seriesCount = seriesRepo.getAllSeries().size();
         Collections.sort(continuing, (a, b) -> Long.compare(b.lastPlayedAt, a.lastPlayedAt));
         Collections.sort(favorites, (a, b) -> Long.compare(b.lastPlayedAt, a.lastPlayedAt));
         Collections.sort(recent, (a, b) -> Long.compare(b.addedAt, a.addedAt));
@@ -248,7 +262,8 @@ public class MainActivity extends Activity {
         stats.setGravity(Gravity.CENTER);
         stats.setPadding(dp(6), dp(4), dp(6), dp(4));
         Ui.card(stats, this, 18);
-        statMovies = homeStat(stats, String.valueOf(all.size()), "FILMES");
+        statMovies = homeStat(stats, String.valueOf(movieCount), "FILMES");
+        statSeries = homeStat(stats, String.valueOf(seriesCount), "SÉRIES");
         statContinue = homeStat(stats, String.valueOf(continuing.size()), "CONTINUAR");
         statFavorites = homeStat(stats, String.valueOf(favorites.size()), "FAVORITOS");
         LinearLayout.LayoutParams statsLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
@@ -509,12 +524,41 @@ public class MainActivity extends Activity {
         List<Movie> movies = new ArrayList<>();
         for (Movie m : repo.getAll()) if (m.lastPlayedAt > 0) movies.add(m);
         Collections.sort(movies, (a, b) -> Long.compare(b.lastPlayedAt, a.lastPlayedAt));
+
+        if (!movies.isEmpty()) {
+            TextView clear = text("🗑  Limpar histórico de assistidos", 12, true, Ui.PURPLE);
+            clear.setGravity(Gravity.CENTER);
+            clear.setBackground(Ui.rounded(Color.argb(245, 255, 255, 255), 16, this));
+            clear.setOnClickListener(v -> confirmClearHistory());
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
+            clp.setMargins(0, 0, 0, dp(14));
+            pageContent.addView(clear, clp);
+        }
+
         pageContent.addView(listSectionTitle("Reproduzidos recentemente", movies.size()));
         if (movies.isEmpty()) {
             pageContent.addView(simpleEmpty("Histórico vazio", "Quando você abrir um filme, ele aparece aqui automaticamente."));
         } else {
             for (Movie m : movies) pageContent.addView(movieListCard(m));
         }
+    }
+
+    private void confirmClearHistory() {
+        new AlertDialog.Builder(this)
+                .setTitle("Limpar histórico?")
+                .setMessage("Isso remove a lista de assistidos/reproduzidos recentemente. O progresso salvo de cada filme ou episódio não será apagado.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Limpar", (d, w) -> {
+                    List<Movie> all = repo.getAll();
+                    for (Movie m : all) {
+                        m.lastPlayedAt = 0;
+                        m.playCount = 0;
+                    }
+                    repo.saveAll(all);
+                    renderPage();
+                    Toast.makeText(this, "Histórico apagado.", Toast.LENGTH_SHORT).show();
+                })
+                .show();
     }
 
     private void renderSettings() {
@@ -527,6 +571,14 @@ public class MainActivity extends Activity {
         LinearLayout createSeries = settingsCard("▤", "Criar série", "Agrupe episódios e organize por temporada e número do episódio");
         createSeries.setOnClickListener(v -> showCreateSeriesDialog());
         pageContent.addView(createSeries);
+
+        LinearLayout backup = settingsCard("⇩", "Exportar backup da organização", "Salva nomes, séries, episódios, favoritos e progresso em um JSON pequeno");
+        backup.setOnClickListener(v -> createBackupDocument());
+        pageContent.addView(backup);
+
+        LinearLayout restore = settingsCard("⇧", "Importar backup da organização", "Restaura os nomes e séries depois de reinstalar e importar a pasta novamente");
+        restore.setOnClickListener(v -> pickBackupDocument());
+        pageContent.addView(restore);
 
         LinearLayout fav = settingsCard("★", "Favoritos", "Abrir todos os filmes que você marcou com estrela");
         fav.setOnClickListener(v -> setPage("favorites"));
@@ -544,7 +596,7 @@ public class MainActivity extends Activity {
         lp.setMargins(0, 0, 0, dp(12));
         info.setLayoutParams(lp);
         info.addView(text("100% offline", 17, true, Ui.TEXT));
-        TextView sub = text("O Cine Offline não tenta mais identificar títulos automaticamente. Você pode renomear os itens e organizar episódios manualmente em séries.", 12, false, Ui.MUTED);
+        TextView sub = text("O Cine Offline não tenta mais identificar títulos automaticamente. Você pode renomear os itens, organizar episódios manualmente em séries e exportar um backup da organização antes de desinstalar o app.", 12, false, Ui.MUTED);
         sub.setPadding(0, dp(7), 0, 0);
         info.addView(sub);
         pageContent.addView(info);
@@ -1253,11 +1305,35 @@ public class MainActivity extends Activity {
         startActivityForResult(i, REQ_FOLDER);
     }
 
+    private void createBackupDocument() {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/json");
+        i.putExtra(Intent.EXTRA_TITLE, "cine_offline_backup.json");
+        startActivityForResult(i, REQ_EXPORT_BACKUP);
+    }
+
+    private void pickBackupDocument() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/json");
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/json", "text/json", "text/plain", "application/octet-stream"});
+        startActivityForResult(i, REQ_IMPORT_BACKUP);
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
+
+        if (requestCode == REQ_EXPORT_BACKUP) {
+            writeBackup(uri);
+            return;
+        } else if (requestCode == REQ_IMPORT_BACKUP) {
+            readAndRestoreBackup(uri);
+            return;
+        }
 
         if (requestCode == REQ_ZIP) {
             askTitleAndImport(uri, IMPORT_ZIP, defaultName(uri));
@@ -1448,6 +1524,219 @@ public class MainActivity extends Activity {
                 }
             });
         });
+    }
+
+    private void writeBackup(Uri uri) {
+        try {
+            JSONObject root = new JSONObject();
+            root.put("format", "cine-offline-organization-v1");
+            root.put("createdAt", System.currentTimeMillis());
+
+            List<Movie> all = repo.getAll();
+            JSONArray movies = new JSONArray();
+            Map<String, Movie> byId = new HashMap<>();
+            for (Movie m : all) {
+                byId.put(m.id, m);
+                JSONObject o = new JSONObject();
+                o.put("key", stableMovieKey(m));
+                o.put("title", m.title);
+                o.put("durationMs", m.durationMs);
+                o.put("favorite", m.favorite);
+                o.put("progressMs", m.progressMs);
+                o.put("lastPlayedAt", m.lastPlayedAt);
+                o.put("playCount", m.playCount);
+                movies.put(o);
+            }
+            root.put("movies", movies);
+
+            JSONArray series = new JSONArray();
+            for (SeriesRepository.SeriesInfo item : seriesRepo.getAllSeries()) {
+                JSONObject o = new JSONObject();
+                o.put("id", item.id);
+                o.put("name", item.name);
+                series.put(o);
+            }
+            root.put("series", series);
+
+            JSONArray assignments = new JSONArray();
+            for (SeriesRepository.SeriesInfo item : seriesRepo.getAllSeries()) {
+                for (SeriesRepository.Assignment a : seriesRepo.getAssignmentsForSeries(item.id)) {
+                    Movie m = byId.get(a.movieId);
+                    if (m == null) continue;
+                    JSONObject o = new JSONObject();
+                    o.put("movieKey", stableMovieKey(m));
+                    o.put("seriesId", a.seriesId);
+                    o.put("season", a.season);
+                    o.put("episode", a.episode);
+                    assignments.put(o);
+                }
+            }
+            root.put("assignments", assignments);
+
+            try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
+                if (out == null) throw new Exception("Não foi possível abrir o arquivo de destino.");
+                out.write(root.toString(2).getBytes(StandardCharsets.UTF_8));
+            }
+            Toast.makeText(this, "Backup salvo. Guarde esse JSON fora do app.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Falha ao criar backup: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void readAndRestoreBackup(Uri uri) {
+        try {
+            byte[] bytes;
+            try (InputStream in = getContentResolver().openInputStream(uri);
+                 ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+                if (in == null) throw new Exception("Não foi possível abrir o backup.");
+                byte[] buffer = new byte[32768];
+                int n;
+                while ((n = in.read(buffer)) >= 0) if (n > 0) bos.write(buffer, 0, n);
+                bytes = bos.toByteArray();
+            }
+            JSONObject root = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+            if (!"cine-offline-organization-v1".equals(root.optString("format"))) {
+                throw new Exception("Esse arquivo não é um backup compatível do Cine Offline.");
+            }
+            restoreBackup(root);
+        } catch (Exception e) {
+            Toast.makeText(this, "Falha ao restaurar backup: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void restoreBackup(JSONObject root) throws Exception {
+        List<Movie> current = repo.getAll();
+        Map<String, Movie> currentByKey = new HashMap<>();
+        Map<Long, List<Movie>> currentByDuration = new HashMap<>();
+        for (Movie m : current) {
+            currentByKey.put(stableMovieKey(m), m);
+            List<Movie> sameDuration = currentByDuration.get(m.durationMs);
+            if (sameDuration == null) {
+                sameDuration = new ArrayList<>();
+                currentByDuration.put(m.durationMs, sameDuration);
+            }
+            sameDuration.add(m);
+        }
+
+        JSONArray savedMovies = root.optJSONArray("movies");
+        Map<String, Movie> restoredBySavedKey = new HashMap<>();
+        int restoredNames = 0;
+        if (savedMovies != null) {
+            for (int i = 0; i < savedMovies.length(); i++) {
+                JSONObject o = savedMovies.optJSONObject(i);
+                if (o == null) continue;
+                String savedKey = o.optString("key", "");
+                Movie target = currentByKey.get(savedKey);
+
+                // Fallback para itens que não possuem o hash original: só usa duração quando ela é única.
+                if (target == null) {
+                    long duration = o.optLong("durationMs", -1);
+                    List<Movie> sameDuration = currentByDuration.get(duration);
+                    if (sameDuration != null && sameDuration.size() == 1) target = sameDuration.get(0);
+                }
+                if (target == null) continue;
+
+                String title = o.optString("title", "").trim();
+                if (!title.isEmpty()) target.title = title;
+                target.favorite = o.optBoolean("favorite", target.favorite);
+                target.progressMs = Math.max(0, o.optLong("progressMs", target.progressMs));
+                target.lastPlayedAt = Math.max(0, o.optLong("lastPlayedAt", target.lastPlayedAt));
+                target.playCount = Math.max(0, o.optInt("playCount", target.playCount));
+                restoredBySavedKey.put(savedKey, target);
+                restoredNames++;
+            }
+        }
+        repo.saveAll(current);
+
+        // Recria as séries do backup e depois liga cada episódio ao filme atual correspondente.
+        for (SeriesRepository.SeriesInfo old : new ArrayList<>(seriesRepo.getAllSeries())) {
+            seriesRepo.deleteSeries(old.id);
+        }
+        Map<String, String> newSeriesIds = new HashMap<>();
+        JSONArray savedSeries = root.optJSONArray("series");
+        if (savedSeries != null) {
+            for (int i = 0; i < savedSeries.length(); i++) {
+                JSONObject o = savedSeries.optJSONObject(i);
+                if (o == null) continue;
+                String oldId = o.optString("id", "");
+                String name = o.optString("name", "Série");
+                SeriesRepository.SeriesInfo created = seriesRepo.createSeries(name);
+                newSeriesIds.put(oldId, created.id);
+            }
+        }
+
+        int restoredEpisodes = 0;
+        JSONArray savedAssignments = root.optJSONArray("assignments");
+        if (savedAssignments != null) {
+            for (int i = 0; i < savedAssignments.length(); i++) {
+                JSONObject o = savedAssignments.optJSONObject(i);
+                if (o == null) continue;
+                String key = o.optString("movieKey", "");
+                Movie movie = currentByKey.get(key);
+                if (movie == null) movie = restoredBySavedKey.get(key);
+                String seriesId = newSeriesIds.get(o.optString("seriesId", ""));
+                if (movie == null || seriesId == null) continue;
+                seriesRepo.assign(movie.id, seriesId,
+                        Math.max(1, o.optInt("season", 1)),
+                        Math.max(1, o.optInt("episode", 1)));
+                restoredEpisodes++;
+            }
+        }
+
+        renderPage();
+        new AlertDialog.Builder(this)
+                .setTitle("Backup restaurado")
+                .setMessage(restoredNames + " item(ns) tiveram nomes/dados restaurados.\n" +
+                        newSeriesIds.size() + " série(s) recriada(s).\n" +
+                        restoredEpisodes + " episódio(s) reorganizado(s).")
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    /**
+     * Gera uma chave estável para os downloads do app original. A playlist reescrita ainda
+     * contém o identificador hexadecimal da pasta dentro dos Content URIs, então essa chave
+     * continua igual mesmo depois de desinstalar, reinstalar e importar a pasta novamente.
+     */
+    private String stableMovieKey(Movie movie) {
+        String hash = findOriginalResourceHash(movie);
+        if (!hash.isEmpty()) return "resource:" + hash.toUpperCase(Locale.ROOT);
+        // Fallback apenas para outros formatos. O restore ainda exige correspondência segura.
+        return "local:" + movie.id;
+    }
+
+    private String findOriginalResourceHash(Movie movie) {
+        if (movie == null || movie.playlistPath == null || movie.playlistPath.isEmpty()) return "";
+        File f = new File(movie.playlistPath);
+        if (!f.exists() || !f.isFile()) return "";
+        try (InputStream in = new java.io.FileInputStream(f);
+             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[16384];
+            int n;
+            int total = 0;
+            while ((n = in.read(buffer)) >= 0 && total < 512 * 1024) {
+                if (n <= 0) continue;
+                int take = Math.min(n, 512 * 1024 - total);
+                bos.write(buffer, 0, take);
+                total += take;
+            }
+            String text = new String(bos.toByteArray(), StandardCharsets.UTF_8);
+            for (int i = 0; i + 32 <= text.length(); i++) {
+                String candidate = text.substring(i, i + 32);
+                if (isHex32(candidate)) return candidate;
+            }
+        } catch (Exception ignored) {}
+        return "";
+    }
+
+    private boolean isHex32(String value) {
+        if (value == null || value.length() != 32) return false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            boolean ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!ok) return false;
+        }
+        return true;
     }
 
     private void createCoverInBackground(Movie movie) {
