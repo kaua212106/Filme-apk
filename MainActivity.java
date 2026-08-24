@@ -49,6 +49,7 @@ public class MainActivity extends Activity {
     private static final int IMPORT_ZIP = 0;
     private static final int IMPORT_FOLDER_LINKED = 1;
     private static final int IMPORT_FOLDER_COPIED = 2;
+    private static final int IMPORT_LIBRARY_LINKED = 3;
 
     private MovieRepository repo;
     private LinearLayout pageContent;
@@ -808,11 +809,19 @@ public class MainActivity extends Activity {
         subtitle.setPadding(0, dp(5), 0, dp(16));
         card.addView(subtitle);
 
-        View fast = importChoiceRow("⚡", "Usar pasta original", "Mais rápido • não duplica o filme • mantenha a pasta no mesmo lugar", () -> {
+        View library = importChoiceRow("🎬", "Adicionar pasta com vários filmes", "Selecione a pasta Filmes • cada subpasta vira um filme • sem copiar os vídeos", () -> {
+            dialog.dismiss();
+            pickFolder(IMPORT_LIBRARY_LINKED);
+        });
+        card.addView(library, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)));
+
+        View fast = importChoiceRow("⚡", "Usar pasta original", "Para adicionar apenas um filme • não duplica o vídeo", () -> {
             dialog.dismiss();
             pickFolder(IMPORT_FOLDER_LINKED);
         });
-        card.addView(fast, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)));
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76));
+        flp.setMargins(0, dp(9), 0, 0);
+        card.addView(fast, flp);
 
         View safe = importChoiceRow("📥", "Copiar pasta para o app", "Mais seguro • pode apagar/mover a pasta original depois • demora mais", () -> {
             dialog.dismiss();
@@ -909,7 +918,7 @@ public class MainActivity extends Activity {
             askTitleAndImport(uri, IMPORT_ZIP, defaultName(uri));
         } else if (requestCode == REQ_FOLDER) {
             // Só o modo rápido precisa manter acesso permanente à pasta original.
-            if (pendingFolderMode == IMPORT_FOLDER_LINKED) {
+            if (pendingFolderMode == IMPORT_FOLDER_LINKED || pendingFolderMode == IMPORT_LIBRARY_LINKED) {
                 try {
                     int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
                     if ((flags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
@@ -917,7 +926,11 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception ignored) {}
             }
-            askTitleAndImport(uri, pendingFolderMode, "Filme offline");
+            if (pendingFolderMode == IMPORT_LIBRARY_LINKED) {
+                startLibraryImport(uri);
+            } else {
+                askTitleAndImport(uri, pendingFolderMode, "Filme offline");
+            }
         } else if (requestCode == REQ_COVER && pendingCoverMovie != null) {
             copyCover(uri, pendingCoverMovie);
         }
@@ -956,6 +969,77 @@ public class MainActivity extends Activity {
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Adicionar", (d, w) -> startImport(uri, mode, input.getText().toString()))
                 .show();
+    }
+
+    private void startLibraryImport(Uri uri) {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(24), dp(22), dp(24), dp(16));
+
+        ProgressBar spinner = new ProgressBar(this);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
+        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        TextView message = text("🎬 Procurando filmes na pasta…", 13, false, Ui.MUTED);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, dp(14), 0, 0);
+        content.addView(message);
+
+        AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("Adicionando biblioteca")
+                .setView(content)
+                .setCancelable(false)
+                .create();
+        progress.show();
+
+        executor.execute(() -> {
+            MovieImporter.LibraryImportResult result = MovieImporter.importLibraryFolderLinked(
+                    getApplicationContext(), uri,
+                    txt -> runOnUiThread(() -> message.setText(txt))
+            );
+
+            runOnUiThread(() -> {
+                if (!isFinishing()) progress.dismiss();
+
+                if (result.fatalError != null) {
+                    new AlertDialog.Builder(this)
+                            .setTitle("Não foi possível adicionar a pasta")
+                            .setMessage(result.fatalError)
+                            .setPositiveButton("OK", null)
+                            .show();
+                    return;
+                }
+
+                for (Movie movie : result.movies) repo.save(movie);
+
+                if (!result.movies.isEmpty()) {
+                    page = "library";
+                    updateBottomNav();
+                    renderPage();
+                    for (Movie movie : result.movies) createCoverInBackground(movie);
+                }
+
+                String summary = result.movies.size() + (result.movies.size() == 1 ? " filme adicionado" : " filmes adicionados")
+                        + " de " + result.discovered + " encontrado(s).";
+
+                if (result.errors.isEmpty()) {
+                    Toast.makeText(this, "🎬 " + summary, Toast.LENGTH_LONG).show();
+                } else {
+                    StringBuilder details = new StringBuilder(summary);
+                    details.append("\n\nNão foi possível adicionar ").append(result.errors.size()).append(" pasta(s):");
+                    int limit = Math.min(6, result.errors.size());
+                    for (int i = 0; i < limit; i++) details.append("\n• ").append(result.errors.get(i));
+                    if (result.errors.size() > limit) details.append("\n• … e mais ").append(result.errors.size() - limit);
+
+                    new AlertDialog.Builder(this)
+                            .setTitle("Importação concluída")
+                            .setMessage(details.toString())
+                            .setPositiveButton("OK", null)
+                            .show();
+                }
+            });
+        });
     }
 
     private void startImport(Uri uri, int mode, String title) {
@@ -1050,7 +1134,7 @@ public class MainActivity extends Activity {
 
     private void showAbout() {
         new AlertDialog.Builder(this)
-                .setTitle("Cine Offline 3.0")
+                .setTitle("Cine Offline 3.3")
                 .setMessage("Player local para filmes HLS salvos como index.m3u8 + segmentos .dat/.ts.\n\nRecursos: biblioteca, busca, favoritos, histórico, continuar de onde parou, capa automática, capa personalizada, velocidade, avanço/retorno de 10 s e tela cheia.\n\nA reprodução dos filmes importados não usa internet.")
                 .setPositiveButton("OK", null).show();
     }

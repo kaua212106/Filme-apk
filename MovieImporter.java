@@ -9,6 +9,8 @@ import android.provider.OpenableColumns;
 
 import androidx.documentfile.provider.DocumentFile;
 
+import org.json.JSONObject;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -118,15 +120,59 @@ public class MovieImporter {
      * para os arquivos originais via Content URI. A pasta precisa permanecer no mesmo lugar.
      */
     public static ImportResult importFolderLinked(Context context, Uri treeUri, String title, ProgressListener listener) {
+        DocumentFile root = DocumentFile.fromTreeUri(context, treeUri);
+        if (root == null || !root.exists()) {
+            return ImportResult.fail("A pasta selecionada não pôde ser aberta.");
+        }
+        return importFolderLinkedDocument(context, root, title, treeUri.toString(), listener);
+    }
+
+    /**
+     * Importa de uma vez uma pasta como a pasta "Filmes" mostrada pelo usuário. Cada
+     * subpasta que contém uma playlist .m3u8 + partes .dat/.ts vira um filme separado.
+     * Nada é duplicado: todos os filmes continuam usando os arquivos originais.
+     */
+    public static LibraryImportResult importLibraryFolderLinked(Context context, Uri treeUri, ProgressListener listener) {
+        DocumentFile selectedRoot = DocumentFile.fromTreeUri(context, treeUri);
+        if (selectedRoot == null || !selectedRoot.exists()) {
+            return LibraryImportResult.fail("A pasta selecionada não pôde ser aberta.");
+        }
+
+        listener.onProgress("🎬 Procurando filmes dentro da pasta…");
+        List<DocumentFile> movieFolders = discoverMovieFolders(selectedRoot);
+        if (movieFolders.isEmpty()) {
+            return LibraryImportResult.fail("Não encontrei subpastas com index.m3u8 e segmentos .dat/.ts.");
+        }
+
+        List<Movie> movies = new ArrayList<>();
+        List<String> errors = new ArrayList<>();
+        int total = movieFolders.size();
+
+        for (int i = 0; i < total; i++) {
+            DocumentFile folder = movieFolders.get(i);
+            final int current = i + 1;
+            String title = guessMovieTitle(context, folder, current);
+            listener.onProgress("🎬 Adicionando " + current + " de " + total + ": " + title);
+
+            ImportResult result = importFolderLinkedDocument(
+                    context, folder, title, treeUri.toString(),
+                    text -> listener.onProgress("🎬 " + current + "/" + total + " • " + text)
+            );
+            if (result.ok) {
+                movies.add(result.movie);
+            } else {
+                errors.add(title + ": " + result.error);
+            }
+        }
+
+        return new LibraryImportResult(movies, errors, total, null);
+    }
+
+    private static ImportResult importFolderLinkedDocument(Context context, DocumentFile root, String title,
+                                                            String permissionSourceUri, ProgressListener listener) {
         String id = UUID.randomUUID().toString();
         File dir = createMovieDir(context, id);
         if (dir == null) return ImportResult.fail("Não foi possível criar a pasta interna do filme.");
-
-        DocumentFile root = DocumentFile.fromTreeUri(context, treeUri);
-        if (root == null || !root.exists()) {
-            deleteRecursive(dir);
-            return ImportResult.fail("A pasta selecionada não pôde ser aberta.");
-        }
 
         LinkedHolder h = new LinkedHolder();
         try {
@@ -147,7 +193,147 @@ public class MovieImporter {
             }
         }
 
-        return finishLinked(dir, id, title, h.playlist, h.segments, treeUri.toString(), listener);
+        return finishLinked(dir, id, title, h.playlist, h.segments, permissionSourceUri, listener);
+    }
+
+    private static List<DocumentFile> discoverMovieFolders(DocumentFile selectedRoot) {
+        List<DocumentFile> direct = new ArrayList<>();
+        try {
+            for (DocumentFile child : selectedRoot.listFiles()) {
+                if (child.isDirectory() && containsMoviePackage(child)) {
+                    direct.add(child);
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // No formato da pasta "Filmes", cada pasta hexadecimal é um filme.
+        if (!direct.isEmpty()) return direct;
+
+        // Também aceita selecionar diretamente a pasta de um único filme.
+        List<DocumentFile> result = new ArrayList<>();
+        if (containsMoviePackage(selectedRoot)) result.add(selectedRoot);
+        return result;
+    }
+
+    private static boolean containsMoviePackage(DocumentFile folder) {
+        MovieProbe probe = new MovieProbe();
+        probeMoviePackage(folder, probe);
+        return probe.playlist && probe.segment;
+    }
+
+    private static void probeMoviePackage(DocumentFile folder, MovieProbe probe) {
+        if (probe.playlist && probe.segment) return;
+        DocumentFile[] files;
+        try { files = folder.listFiles(); } catch (Exception e) { return; }
+        for (DocumentFile item : files) {
+            if (probe.playlist && probe.segment) return;
+            if (item.isDirectory()) {
+                probeMoviePackage(item, probe);
+                continue;
+            }
+            String name = item.getName();
+            if (name == null) continue;
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (lower.endsWith(".m3u8")) probe.playlist = true;
+            if (lower.endsWith(".dat") || lower.endsWith(".ts")) probe.segment = true;
+        }
+    }
+
+    private static String guessMovieTitle(Context context, DocumentFile folder, int index) {
+        String metadataTitle = findMetadataTitle(context, folder, 0);
+        if (metadataTitle != null && !metadataTitle.trim().isEmpty()) {
+            return cleanTitle(metadataTitle);
+        }
+
+        String folderName = folder.getName();
+        if (folderName != null) {
+            String trimmed = folderName.trim();
+            // Pastas como 0C7DC2A47234F8E971C5E9E345F725FF não são úteis como título.
+            if (!trimmed.matches("(?i)[0-9a-f]{16,}")) return cleanTitle(trimmed);
+        }
+        return String.format(Locale.getDefault(), "Filme %02d", index);
+    }
+
+    private static String findMetadataTitle(Context context, DocumentFile folder, int depth) {
+        if (depth > 3) return null;
+        DocumentFile[] files;
+        try { files = folder.listFiles(); } catch (Exception e) { return null; }
+
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) continue;
+            String name = item.getName();
+            if (name == null) continue;
+            String lower = name.toLowerCase(Locale.ROOT);
+
+            try {
+                if (lower.equals("title.txt") || lower.equals("name.txt") || lower.equals("movie.txt")) {
+                    String raw = readLimitedText(context, item.getUri(), 4096);
+                    if (raw != null && !raw.trim().isEmpty()) return raw.trim();
+                }
+
+                boolean likelyMetadata = lower.endsWith(".json") &&
+                        (lower.contains("meta") || lower.contains("info") || lower.contains("movie") ||
+                                lower.contains("video") || lower.contains("detail"));
+                if (likelyMetadata) {
+                    String raw = readLimitedText(context, item.getUri(), 128 * 1024);
+                    String title = titleFromJson(raw);
+                    if (title != null && !title.trim().isEmpty()) return title.trim();
+                }
+            } catch (Exception ignored) {}
+        }
+
+        for (DocumentFile item : files) {
+            if (item.isDirectory()) {
+                String found = findMetadataTitle(context, item, depth + 1);
+                if (found != null && !found.trim().isEmpty()) return found;
+            }
+        }
+        return null;
+    }
+
+    private static String titleFromJson(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return null;
+        try {
+            JSONObject o = new JSONObject(raw);
+            String[] keys = {"title", "movieTitle", "videoTitle", "original_title", "originalTitle", "name"};
+            for (String key : keys) {
+                String value = o.optString(key, "").trim();
+                if (!value.isEmpty()) return value;
+            }
+            String[] nestedKeys = {"movie", "video", "data", "info", "metadata"};
+            for (String nested : nestedKeys) {
+                JSONObject n = o.optJSONObject(nested);
+                if (n == null) continue;
+                for (String key : keys) {
+                    String value = n.optString(key, "").trim();
+                    if (!value.isEmpty()) return value;
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static String readLimitedText(Context context, Uri uri, int maxBytes) throws Exception {
+        try (InputStream in = context.getContentResolver().openInputStream(uri)) {
+            if (in == null) return null;
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int total = 0;
+            int n;
+            while ((n = in.read(buffer, 0, Math.min(buffer.length, maxBytes - total))) > 0) {
+                bos.write(buffer, 0, n);
+                total += n;
+                if (total >= maxBytes) break;
+            }
+            return bos.toString(StandardCharsets.UTF_8.name());
+        }
+    }
+
+    private static String cleanTitle(String value) {
+        String s = value == null ? "" : value.trim();
+        s = s.replace('_', ' ').replaceAll("\\s+", " ");
+        if (s.length() > 100) s = s.substring(0, 100).trim();
+        return s.isEmpty() ? "Filme offline" : s;
     }
 
     private static File createMovieDir(Context context, String id) {
@@ -498,6 +684,29 @@ public class MovieImporter {
         }
         //noinspection ResultOfMethodCallIgnored
         file.delete();
+    }
+
+    public static class LibraryImportResult {
+        public final List<Movie> movies;
+        public final List<String> errors;
+        public final int discovered;
+        public final String fatalError;
+
+        LibraryImportResult(List<Movie> movies, List<String> errors, int discovered, String fatalError) {
+            this.movies = movies;
+            this.errors = errors;
+            this.discovered = discovered;
+            this.fatalError = fatalError;
+        }
+
+        public static LibraryImportResult fail(String error) {
+            return new LibraryImportResult(new ArrayList<>(), new ArrayList<>(), 0, error);
+        }
+    }
+
+    private static class MovieProbe {
+        boolean playlist;
+        boolean segment;
     }
 
     private static class CopiedHolder {
