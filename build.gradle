@@ -10,8 +10,8 @@ android {
         applicationId 'com.offlineplayer.cineoffline'
         minSdk 24
         targetSdk 35
-        versionCode 6
-        versionName '3.4.0'
+        versionCode 7
+        versionName '3.5.0'
     }
 
     // Projeto achatado: os arquivos ficam todos na raiz do GitHub.
@@ -42,8 +42,6 @@ def prepareGeneratedRes = tasks.register('prepareGeneratedRes') {
     doLast {
         def drawable = new File(generatedRes, 'drawable')
         drawable.mkdirs()
-        def xml = new File(generatedRes, 'xml')
-        xml.mkdirs()
         def sourceIcon = file('icone.png')
         if (!sourceIcon.exists()) {
             throw new GradleException('icone.png não encontrado na raiz do repositório.')
@@ -53,18 +51,6 @@ def prepareGeneratedRes = tasks.register('prepareGeneratedRes') {
             into drawable
             rename { 'icone.png' }
         }
-
-        // Configuração do serviço de acessibilidade usada somente para ler os títulos
-        // que aparecem no app original. O packageNames impede leitura de outros apps.
-        new File(xml, 'cine_title_accessibility.xml').text = '''<?xml version="1.0" encoding="utf-8"?>
-<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled"
-    android:accessibilityFeedbackType="feedbackGeneric"
-    android:notificationTimeout="120"
-    android:canRetrieveWindowContent="true"
-    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
-    android:packageNames="com.starshort.minishort" />
-'''
     }
 }
 
@@ -77,4 +63,7 @@ dependencies {
     implementation 'androidx.media3:media3-exoplayer:1.5.1'
     implementation 'androidx.media3:media3-exoplayer-hls:1.5.1'
     implementation 'androidx.media3:media3-ui:1.5.1'
+
+    // OCR local. Os frames são processados em memória e não são enviados como imagem.
+    implementation 'com.google.mlkit:text-recognition:16.0.1'
 }

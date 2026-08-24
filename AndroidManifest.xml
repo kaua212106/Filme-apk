@@ -1,13 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Necessária apenas para conversar com o servidor LOCAL 127.0.0.1 do app original. -->
+    <!-- Usada somente para confirmar pistas de título no Wikidata. -->
     <uses-permission android:name="android.permission.INTERNET" />
-
-    <!-- Permite localizar/abrir somente o app que criou a pasta Filmes no Android 11+. -->
-    <queries>
-        <package android:name="com.starshort.minishort" />
-    </queries>
 
     <application
         android:allowBackup="true"
@@ -15,21 +10,7 @@
         android:roundIcon="@drawable/icone"
         android:label="Cine Offline"
         android:supportsRtl="true"
-        android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
-
-        <service
-            android:name=".OriginalTitleAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="false"
-            android:label="Identificação de títulos do Cine Offline">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/cine_title_accessibility" />
-        </service>
 
         <activity
             android:name=".PlayerActivity"

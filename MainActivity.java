@@ -502,9 +502,9 @@ public class MainActivity extends Activity {
         catalog.setOnClickListener(v -> pickCatalogFolder());
         pageContent.addView(catalog);
 
-        LinearLayout identify = settingsCard("🔎", "Identificar títulos pela internet",
-                "Sem root • não depende dos downloads do app original • salva os nomes para uso offline");
-        identify.setOnClickListener(v -> showInternetTitleTools());
+        LinearLayout identify = settingsCard("🎞️", "Identificar pelo conteúdo do vídeo",
+                "Sem root • analisa frames em memória com OCR • não salva imagens");
+        identify.setOnClickListener(v -> showContentTitleTools());
         pageContent.addView(identify);
 
         LinearLayout fav = settingsCard("★", "Favoritos", "Abrir todos os filmes que você marcou com estrela");
@@ -960,16 +960,16 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void showInternetTitleTools() {
+    private void showContentTitleTools() {
         new AlertDialog.Builder(this)
-                .setTitle("🔎 Identificar títulos pela internet")
-                .setMessage("O Cine Offline vai usar o código de cada pasta, como 66AB4C2F..., e consultar o catálogo usado pelo app que criou os downloads.\n\nEle não precisa de root, Acessibilidade nem dos filmes ainda cadastrados no app original. Os vídeos continuam na pasta atual e não são copiados.\n\nPor segurança, o nome só é alterado quando houver uma associação exata pelo código ou pela URL do vídeo. Se não houver confirmação, o item continua com o nome atual.\n\nDepois que um nome for encontrado, ele fica salvo no Cine Offline e continua aparecendo sem internet.")
+                .setTitle("🎞️ Identificar pelo conteúdo")
+                .setMessage("O Cine Offline vai abrir alguns frames de cada item apenas na memória, fazer OCR local e usar os textos mais fortes como pista do título. Nenhuma imagem é salva.\n\nDepois, ele consulta o Wikidata somente para confirmar se a pista realmente corresponde a um filme ou a um episódio. O nome só é alterado com confiança alta.\n\nPara séries: se o vídeo revelar apenas o nome geral da série, o app NÃO renomeia o episódio, porque vários episódios ficariam com o mesmo nome. Ele só aplica automaticamente quando conseguir confirmar o episódio específico.\n\nA análise pode levar alguns minutos dependendo da quantidade de filmes.")
                 .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Identificar agora", (d, w) -> startInternetTitleIdentification())
+                .setPositiveButton("Analisar agora", (d, w) -> startContentTitleIdentification())
                 .show();
     }
 
-    private void startInternetTitleIdentification() {
+    private void startContentTitleIdentification() {
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -979,20 +979,20 @@ public class MainActivity extends Activity {
         spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
         content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
 
-        TextView message = text("Lendo os códigos dos arquivos…", 13, false, Ui.MUTED);
+        TextView message = text("Preparando OCR local…", 13, false, Ui.MUTED);
         message.setGravity(Gravity.CENTER);
         message.setPadding(0, dp(14), 0, 0);
         content.addView(message);
 
         AlertDialog progress = new AlertDialog.Builder(this)
-                .setTitle("Identificando filmes e séries")
+                .setTitle("Analisando filmes e séries")
                 .setView(content)
                 .setCancelable(false)
                 .create();
         progress.show();
 
         executor.execute(() -> {
-            InternetTitleIdentifier.Result result = InternetTitleIdentifier.identify(
+            ContentTitleIdentifier.Result result = ContentTitleIdentifier.identify(
                     getApplicationContext(), repo,
                     txt -> runOnUiThread(() -> {
                         if (!isFinishing()) message.setText(txt);
@@ -1013,14 +1013,11 @@ public class MainActivity extends Activity {
                 renderPage();
                 StringBuilder msg = new StringBuilder();
                 msg.append("✅ ").append(result.renamed).append(" título(s) atualizado(s).\n")
-                        .append("• ").append(result.idsFound).append(" código(s) encontrado(s) na biblioteca\n")
-                        .append("• ").append(result.matched).append(" associação(ões) confirmada(s)\n")
-                        .append("• ").append(result.notMatched).append(" item(ns) ainda sem identificação");
-                if (result.cachedMatches > 0) {
-                    msg.append("\n• ").append(result.cachedMatches).append(" resultado(s) reaproveitado(s) do cache offline");
-                }
-                if (result.networkMatches > 0) {
-                    msg.append("\n• ").append(result.networkMatches).append(" resultado(s) novo(s) encontrados na internet");
+                        .append("• ").append(result.analyzed).append(" item(ns) provisório(s) analisado(s)\n")
+                        .append("• ").append(result.confirmedMovies).append(" filme(s) confirmado(s)\n")
+                        .append("• ").append(result.confirmedEpisodes).append(" episódio(s) confirmado(s)");
+                if (result.seriesOnly > 0) {
+                    msg.append("\n• ").append(result.seriesOnly).append(" item(ns) com série reconhecida, mas episódio incerto");
                 }
                 if (result.warning != null && !result.warning.isEmpty()) {
                     msg.append("\n\n⚠ ").append(result.warning);
@@ -1030,7 +1027,7 @@ public class MainActivity extends Activity {
                 }
 
                 new AlertDialog.Builder(this)
-                        .setTitle("Identificação concluída")
+                        .setTitle("Análise concluída")
                         .setMessage(msg.toString())
                         .setPositiveButton("OK", null)
                         .show();
