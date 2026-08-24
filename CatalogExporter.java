@@ -3,10 +3,12 @@ package com.offlineplayer.cineoffline;
 import android.content.Context;
 import android.net.Uri;
 import android.util.JsonWriter;
+import android.util.Base64;
 
 import androidx.documentfile.provider.DocumentFile;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -53,6 +55,10 @@ public final class CatalogExporter {
     private static final int MAX_TEXT_TOTAL = 8 * 1024 * 1024;
     private static final int MAX_MEDIA_SAMPLES = 14;
     private static final int MAX_OTHER_FILES_PER_FOLDER = 80;
+    // Arquivos pequenos desconhecidos (como o arquivo "db" da pasta Filmes)
+    // podem conter justamente a relação hash -> nome do filme/série.
+    private static final int MAX_BINARY_PER_FILE = 512 * 1024;
+    private static final int MAX_BINARY_TOTAL = 2 * 1024 * 1024;
 
     private static final Pattern[] TITLE_PATTERNS = new Pattern[] {
             Pattern.compile("\\\"(?:title|name|movie_title|original_title|showtitle|seriesName|series_name|episodeName|episode_name)\\\"\\s*:\\s*\\\"([^\\\"]{2,180})\\\"", Pattern.CASE_INSENSITIVE),
@@ -88,6 +94,7 @@ public final class CatalogExporter {
         int imageFiles;
         int otherFiles;
         int textBytes;
+        int binaryBytes;
     }
 
     public static Result scanToCache(Context context, Uri treeUri, ProgressListener listener) throws Exception {
@@ -108,10 +115,10 @@ public final class CatalogExporter {
 
             w.setIndent("  ");
             w.beginObject();
-            w.name("format").value("cine-offline-catalog-v1");
+            w.name("format").value("cine-offline-catalog-v2");
             w.name("createdAt").value(new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(new Date()));
             w.name("sourceFolderName").value(safe(root.getName(), "Filmes"));
-            w.name("importantNote").value("Os arquivos de vídeo pesados não foram copiados. O catálogo contém nomes, tamanhos, estrutura e pequenos trechos de metadados para identificação.");
+            w.name("importantNote").value("Os arquivos de vídeo pesados não foram copiados. O catálogo contém nomes, tamanhos, estrutura, metadados e o conteúdo Base64 de arquivos pequenos desconhecidos (por exemplo db) para permitir identificar os títulos.");
             w.name("root");
             writeDirectory(context, root, "", w, counters, listener, 0);
             w.name("summary");
@@ -124,6 +131,7 @@ public final class CatalogExporter {
             w.name("imageFiles").value(counters.imageFiles);
             w.name("otherFiles").value(counters.otherFiles);
             w.name("metadataTextBytesIncluded").value(counters.textBytes);
+            w.name("smallBinaryBytesIncluded").value(counters.binaryBytes);
             w.endObject();
             w.endObject();
         } catch (Exception e) {
@@ -234,11 +242,7 @@ public final class CatalogExporter {
         int written = 0;
         for (DocumentFile f : others) {
             if (written++ >= MAX_OTHER_FILES_PER_FOLDER) break;
-            w.beginObject();
-            w.name("name").value(safe(f.getName(), "arquivo"));
-            w.name("size").value(Math.max(0L, f.length()));
-            w.name("lastModified").value(f.lastModified());
-            w.endObject();
+            writeOtherFile(context, f, w, c);
         }
         w.endArray();
         w.name("otherFilesNotListed").value(Math.max(0, localOtherCount + localImageCount - others.size()));
@@ -294,6 +298,65 @@ public final class CatalogExporter {
         if (!text.isEmpty()) w.name("text").value(text);
         if (error != null) w.name("readError").value(error);
         w.endObject();
+    }
+
+
+    private static void writeOtherFile(Context context, DocumentFile f, JsonWriter w,
+                                       Counters c) throws Exception {
+        String name = safe(f.getName(), "arquivo");
+        long size = Math.max(0L, f.length());
+        String ext = extension(name);
+        boolean isImage = IMAGE_FILES.contains(ext);
+        String base64 = null;
+        String error = null;
+
+        // Não inclui imagens nem arquivos grandes. O objetivo aqui é capturar
+        // bancos/índices pequenos que possam guardar os nomes verdadeiros.
+        if (!isImage && size > 0 && size <= MAX_BINARY_PER_FILE
+                && c.binaryBytes < MAX_BINARY_TOTAL) {
+            int remaining = MAX_BINARY_TOTAL - c.binaryBytes;
+            int limit = (int) Math.min(size, Math.min(MAX_BINARY_PER_FILE, remaining));
+            try {
+                byte[] bytes = readBytes(context, f.getUri(), limit);
+                if (bytes.length == size) {
+                    base64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+                    c.binaryBytes += bytes.length;
+                }
+            } catch (Exception e) {
+                error = e.getClass().getSimpleName() + ": " + safe(e.getMessage(), "não foi possível ler");
+            }
+        }
+
+        w.beginObject();
+        w.name("name").value(name);
+        w.name("size").value(size);
+        w.name("lastModified").value(f.lastModified());
+        if (base64 != null) {
+            w.name("contentEncoding").value("base64");
+            w.name("contentBase64").value(base64);
+        }
+        if (error != null) w.name("readError").value(error);
+        w.endObject();
+    }
+
+    private static byte[] readBytes(Context context, Uri uri, int maxBytes) throws Exception {
+        try (InputStream in = context.getContentResolver().openInputStream(uri);
+             ByteArrayOutputStream out = new ByteArrayOutputStream(Math.min(maxBytes, 64 * 1024))) {
+            if (in == null) throw new IllegalStateException("arquivo não pôde ser aberto");
+            byte[] buf = new byte[8192];
+            int total = 0;
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                checkInterrupted();
+                if (n == 0) continue;
+                if (total + n > maxBytes) {
+                    throw new IllegalStateException("arquivo ultrapassou o limite de leitura");
+                }
+                out.write(buf, 0, n);
+                total += n;
+            }
+            return out.toByteArray();
+        }
     }
 
     private static final class ReadTextResult {
