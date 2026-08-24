@@ -1308,13 +1308,16 @@ public class MainActivity extends Activity {
                     return;
                 }
 
-                for (Movie movie : result.movies) repo.save(movie);
+                // Grava a biblioteca inteira em uma única operação. Antes cada filme
+                // reabria e regravava o JSON completo, o que ficava lento com dezenas de itens.
+                repo.saveAll(result.movies);
 
                 if (!result.movies.isEmpty()) {
                     page = "library";
                     updateBottomNav();
                     renderPage();
-                    for (Movie movie : result.movies) createCoverInBackground(movie);
+                    // Não gera 47 capas logo após a importação. Abrir dezenas de segmentos
+                    // de vídeo em sequência deixava o celular ocupado mesmo depois da lista aparecer.
                 }
 
                 String summary = result.movies.size() + (result.movies.size() == 1 ? " filme adicionado" : " filmes adicionados")

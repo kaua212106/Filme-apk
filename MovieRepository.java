@@ -57,6 +57,25 @@ public class MovieRepository {
         persist(list);
     }
 
+    /** Salva vários filmes de uma vez, evitando reprocessar o JSON da biblioteca a cada item. */
+    public synchronized void saveAll(List<Movie> movies) {
+        if (movies == null || movies.isEmpty()) return;
+        List<Movie> list = getAll();
+        for (Movie movie : movies) {
+            if (movie == null) continue;
+            boolean replaced = false;
+            for (int i = 0; i < list.size(); i++) {
+                if (list.get(i).id.equals(movie.id)) {
+                    list.set(i, movie);
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) list.add(movie);
+        }
+        persist(list);
+    }
+
     public synchronized void delete(Movie movie) {
         List<Movie> list = getAll();
         list.removeIf(m -> m.id.equals(movie.id));
