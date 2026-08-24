@@ -46,8 +46,6 @@ public class MainActivity extends Activity {
     private static final int REQ_ZIP = 1001;
     private static final int REQ_FOLDER = 1002;
     private static final int REQ_COVER = 1003;
-    private static final int REQ_CATALOG_FOLDER = 1004;
-    private static final int REQ_SAVE_CATALOG = 1005;
 
     private static final int IMPORT_ZIP = 0;
     private static final int IMPORT_FOLDER_LINKED = 1;
@@ -55,6 +53,7 @@ public class MainActivity extends Activity {
     private static final int IMPORT_LIBRARY_LINKED = 3;
 
     private MovieRepository repo;
+    private SeriesRepository seriesRepo;
     private LinearLayout pageContent;
     private LinearLayout bottomNav;
     private final List<TextView> navButtons = new ArrayList<>();
@@ -66,8 +65,6 @@ public class MainActivity extends Activity {
     private EditText searchInput;
     private LinearLayout searchResults;
     private Movie pendingCoverMovie;
-    private File pendingCatalogFile;
-    private String pendingCatalogSummary = "";
     private int pendingFolderMode = IMPORT_FOLDER_LINKED;
     private String page = "home";
 
@@ -78,6 +75,7 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(Color.BLACK);
         getWindow().getDecorView().setSystemUiVisibility(0);
         repo = new MovieRepository(this);
+        seriesRepo = new SeriesRepository(this);
         buildUi();
         renderPage();
     }
@@ -196,6 +194,7 @@ public class MainActivity extends Activity {
             String target = String.valueOf(item.getTag());
             boolean active = page.equals(target);
             if (page.equals("favorites") && target.equals("home")) active = true;
+            if (page.startsWith("series:") && target.equals("library")) active = true;
             item.setBackground(active ? Ui.softGradient(this, 18) : new ColorDrawable(Color.TRANSPARENT));
             for (int j = 0; j < item.getChildCount(); j++) {
                 View v = item.getChildAt(j);
@@ -221,6 +220,7 @@ public class MainActivity extends Activity {
         else if (page.equals("library")) renderLibrary(false);
         else if (page.equals("favorites")) renderLibrary(true);
         else if (page.equals("history")) renderHistory();
+        else if (page.startsWith("series:")) renderSeriesDetail(page.substring("series:".length()));
         else renderSettings();
     }
 
@@ -385,7 +385,10 @@ public class MainActivity extends Activity {
         TextView title = text(m.title, 15, true, Ui.TEXT);
         title.setMaxLines(2);
         info.addView(title);
-        TextView meta = text(progressText(m), 10, false, Ui.MUTED);
+        String homeMeta = progressText(m);
+        String homeSeries = seriesMeta(m);
+        if (!homeSeries.isEmpty()) homeMeta = homeSeries + " • " + homeMeta;
+        TextView meta = text(homeMeta, 10, false, Ui.MUTED);
         meta.setPadding(0, dp(5), 0, 0);
         info.addView(meta);
         if (isContinue(m) && m.durationMs > 0) {
@@ -461,20 +464,43 @@ public class MainActivity extends Activity {
 
     private void renderLibrary(boolean favoritesOnly) {
         addPageHeading(favoritesOnly ? "Favoritos" : "Biblioteca",
-                favoritesOnly ? "Seus filmes marcados com estrela." : "Todos os filmes salvos neste aparelho.");
+                favoritesOnly ? "Seus filmes marcados com estrela." : "Filmes avulsos e séries organizadas por você.");
+
         List<Movie> movies = repo.getAll();
         if (favoritesOnly) {
             List<Movie> filtered = new ArrayList<>();
             for (Movie m : movies) if (m.favorite) filtered.add(m);
             movies = filtered;
+            Collections.sort(movies, (a, b) -> Long.compare(b.addedAt, a.addedAt));
+            pageContent.addView(listSectionTitle("Seus favoritos", movies.size()));
+            if (movies.isEmpty()) {
+                pageContent.addView(simpleEmpty("Sem favoritos", "Toque na estrela de qualquer filme para adicionar aqui."));
+            } else {
+                for (Movie m : movies) pageContent.addView(movieListCard(m));
+            }
+            return;
         }
-        Collections.sort(movies, (a, b) -> Long.compare(b.addedAt, a.addedAt));
-        pageContent.addView(listSectionTitle(favoritesOnly ? "Seus favoritos" : "Minha biblioteca", movies.size()));
-        if (movies.isEmpty()) {
-            pageContent.addView(simpleEmpty(favoritesOnly ? "Sem favoritos" : "Sua biblioteca está vazia",
-                    favoritesOnly ? "Toque na estrela de qualquer filme para adicionar aqui." : "Use o botão + no topo para importar um ZIP ou uma pasta."));
+
+        List<SeriesRepository.SeriesInfo> series = seriesRepo.getAllSeries();
+        if (!series.isEmpty()) {
+            pageContent.addView(listSectionTitle("Séries", series.size()));
+            for (SeriesRepository.SeriesInfo item : series) pageContent.addView(seriesCard(item));
+        }
+
+        List<Movie> loose = new ArrayList<>();
+        for (Movie m : movies) if (seriesRepo.getAssignment(m.id) == null) loose.add(m);
+        Collections.sort(loose, (a, b) -> Long.compare(b.addedAt, a.addedAt));
+
+        String sectionTitle = series.isEmpty() ? "Minha biblioteca" : "Filmes avulsos";
+        pageContent.addView(listSectionTitle(sectionTitle, loose.size()));
+        if (loose.isEmpty()) {
+            if (movies.isEmpty()) {
+                pageContent.addView(simpleEmpty("Sua biblioteca está vazia", "Use o botão + no topo para importar um ZIP ou uma pasta."));
+            } else {
+                pageContent.addView(simpleEmpty("Tudo organizado", "Todos os itens da biblioteca já estão dentro de séries."));
+            }
         } else {
-            for (Movie m : movies) pageContent.addView(movieListCard(m));
+            for (Movie m : loose) pageContent.addView(movieListCard(m));
         }
     }
 
@@ -498,20 +524,15 @@ public class MainActivity extends Activity {
         quick.setOnClickListener(v -> showImportChoice());
         pageContent.addView(quick);
 
-        LinearLayout catalog = settingsCard("🧾", "Gerar catálogo para identificação", "Lê nomes e metadados da pasta sem copiar os vídeos pesados");
-        catalog.setOnClickListener(v -> pickCatalogFolder());
-        pageContent.addView(catalog);
-
-        LinearLayout identify = settingsCard("🎞️", "Identificar pelo conteúdo do vídeo",
-                "Sem root • analisa frames em memória com OCR • não salva imagens");
-        identify.setOnClickListener(v -> showContentTitleTools());
-        pageContent.addView(identify);
+        LinearLayout createSeries = settingsCard("▤", "Criar série", "Agrupe episódios e organize por temporada e número do episódio");
+        createSeries.setOnClickListener(v -> showCreateSeriesDialog());
+        pageContent.addView(createSeries);
 
         LinearLayout fav = settingsCard("★", "Favoritos", "Abrir todos os filmes que você marcou com estrela");
         fav.setOnClickListener(v -> setPage("favorites"));
         pageContent.addView(fav);
 
-        LinearLayout about = settingsCard("ⓘ", "Sobre o Cine Offline", "Recursos, funcionamento offline e informações da versão 3.0");
+        LinearLayout about = settingsCard("ⓘ", "Sobre o Cine Offline", "Recursos, funcionamento offline e informações do app");
         about.setOnClickListener(v -> showAbout());
         pageContent.addView(about);
 
@@ -523,7 +544,7 @@ public class MainActivity extends Activity {
         lp.setMargins(0, 0, 0, dp(12));
         info.setLayoutParams(lp);
         info.addView(text("100% offline", 17, true, Ui.TEXT));
-        TextView sub = text("O Cine Offline não usa internet para reproduzir filmes já importados. O progresso, favoritos e histórico ficam salvos no aparelho.", 12, false, Ui.MUTED);
+        TextView sub = text("O Cine Offline não tenta mais identificar títulos automaticamente. Você pode renomear os itens e organizar episódios manualmente em séries.", 12, false, Ui.MUTED);
         sub.setPadding(0, dp(7), 0, 0);
         info.addView(sub);
         pageContent.addView(info);
@@ -622,6 +643,8 @@ public class MainActivity extends Activity {
         info.addView(title);
 
         String meta = progressText(m);
+        String seriesMeta = seriesMeta(m);
+        if (!seriesMeta.isEmpty()) meta = seriesMeta + " • " + meta;
         if (page.equals("history") && m.lastPlayedAt > 0) meta = "Visto " + relativeDate(m.lastPlayedAt) + " • " + meta;
         TextView details = text(meta, 10, false, Ui.MUTED);
         details.setPadding(0, dp(5), 0, dp(8));
@@ -677,6 +700,303 @@ public class MainActivity extends Activity {
             cover.setPadding(dp(14), dp(14), dp(14), dp(14));
         }
         return cover;
+    }
+
+    private View seriesCard(SeriesRepository.SeriesInfo series) {
+        LinearLayout card = new LinearLayout(this);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(14), dp(13), dp(14), dp(13));
+        Ui.card(card, this, 22);
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cp.setMargins(0, 0, 0, dp(11));
+        card.setLayoutParams(cp);
+        card.setOnClickListener(v -> setPage("series:" + series.id));
+
+        TextView icon = text("▤", 25, true, Ui.PURPLE);
+        icon.setGravity(Gravity.CENTER);
+        icon.setBackground(Ui.softGradient(this, 16));
+        card.addView(icon, new LinearLayout.LayoutParams(dp(54), dp(54)));
+
+        LinearLayout words = new LinearLayout(this);
+        words.setOrientation(LinearLayout.VERTICAL);
+        words.setPadding(dp(13), 0, dp(8), 0);
+        TextView name = text(series.name, 16, true, Ui.TEXT);
+        name.setMaxLines(2);
+        words.addView(name);
+        int episodes = seriesRepo.countMovies(series.id);
+        int seasons = seriesRepo.countSeasons(series.id);
+        String details = episodes + (episodes == 1 ? " episódio" : " episódios");
+        if (seasons > 0) details += " • " + seasons + (seasons == 1 ? " temporada" : " temporadas");
+        TextView sub = text(details, 10, false, Ui.MUTED);
+        sub.setPadding(0, dp(4), 0, 0);
+        words.addView(sub);
+        card.addView(words, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+
+        TextView arrow = text("›", 28, false, Ui.MUTED);
+        arrow.setGravity(Gravity.CENTER);
+        card.addView(arrow, new LinearLayout.LayoutParams(dp(30), dp(54)));
+        return card;
+    }
+
+    private void renderSeriesDetail(String seriesId) {
+        SeriesRepository.SeriesInfo series = seriesRepo.getSeries(seriesId);
+        if (series == null) {
+            page = "library";
+            updateBottomNav();
+            renderLibrary(false);
+            return;
+        }
+
+        addPageHeading(series.name, "Episódios organizados por temporada.");
+
+        LinearLayout add = settingsCard("＋", "Adicionar episódios", "Escolha itens da biblioteca para colocar nesta série");
+        add.setOnClickListener(v -> showAddEpisodesToSeries(series));
+        pageContent.addView(add);
+
+        LinearLayout rename = settingsCard("✎", "Renomear série", "Alterar somente o nome do grupo");
+        rename.setOnClickListener(v -> showRenameSeries(series));
+        pageContent.addView(rename);
+
+        List<SeriesRepository.Assignment> assignments = seriesRepo.getAssignmentsForSeries(series.id);
+        if (assignments.isEmpty()) {
+            pageContent.addView(simpleEmpty("Série vazia", "Toque em “Adicionar episódios” para começar a organizar."));
+        } else {
+            int currentSeason = -1;
+            for (SeriesRepository.Assignment a : assignments) {
+                Movie movie = repo.getById(a.movieId);
+                if (movie == null) continue;
+                if (a.season != currentSeason) {
+                    currentSeason = a.season;
+                    TextView seasonTitle = text("Temporada " + currentSeason, 18, true, Color.WHITE);
+                    seasonTitle.setPadding(dp(3), dp(8), 0, dp(10));
+                    pageContent.addView(seasonTitle);
+                }
+                pageContent.addView(movieListCard(movie));
+            }
+        }
+
+        LinearLayout delete = settingsCard("×", "Excluir série", "Remove apenas a organização; os vídeos continuam na biblioteca");
+        delete.setOnClickListener(v -> confirmDeleteSeries(series));
+        pageContent.addView(delete);
+    }
+
+    private String seriesMeta(Movie m) {
+        if (seriesRepo == null || m == null) return "";
+        SeriesRepository.Assignment a = seriesRepo.getAssignment(m.id);
+        if (a == null) return "";
+        SeriesRepository.SeriesInfo s = seriesRepo.getSeries(a.seriesId);
+        StringBuilder out = new StringBuilder();
+        if (s != null && s.name != null && !s.name.trim().isEmpty()) out.append(s.name.trim());
+        if (a.season > 0) {
+            if (out.length() > 0) out.append(" • ");
+            out.append("T").append(a.season);
+        }
+        if (a.episode > 0) out.append(" E").append(a.episode);
+        return out.toString();
+    }
+
+    private void showCreateSeriesDialog() {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setHint("Nome da série");
+        int pad = dp(18);
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(pad, 0, pad, 0);
+        wrap.addView(input);
+        new AlertDialog.Builder(this)
+                .setTitle("Criar série")
+                .setMessage("Depois você pode adicionar os episódios e definir temporada e número de cada um.")
+                .setView(wrap)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Criar", (d, w) -> {
+                    String name = input.getText().toString().trim();
+                    if (name.isEmpty()) {
+                        Toast.makeText(this, "Digite um nome para a série.", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    SeriesRepository.SeriesInfo series = seriesRepo.createSeries(name);
+                    page = "series:" + series.id;
+                    updateBottomNav();
+                    renderPage();
+                    showAddEpisodesToSeries(series);
+                }).show();
+    }
+
+    private void showRenameSeries(SeriesRepository.SeriesInfo series) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setText(series.name);
+        input.setSelectAllOnFocus(true);
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(dp(18), 0, dp(18), 0);
+        wrap.addView(input);
+        new AlertDialog.Builder(this)
+                .setTitle("Renomear série")
+                .setView(wrap)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Salvar", (d, w) -> {
+                    String name = input.getText().toString().trim();
+                    if (!name.isEmpty()) {
+                        seriesRepo.renameSeries(series.id, name);
+                        renderPage();
+                    }
+                }).show();
+    }
+
+    private void showAddEpisodesToSeries(SeriesRepository.SeriesInfo series) {
+        List<Movie> available = new ArrayList<>();
+        for (Movie m : repo.getAll()) {
+            SeriesRepository.Assignment a = seriesRepo.getAssignment(m.id);
+            if (a == null) available.add(m);
+        }
+        Collections.sort(available, (a, b) -> Long.compare(a.addedAt, b.addedAt));
+        if (available.isEmpty()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Nenhum item disponível")
+                    .setMessage("Todos os vídeos já estão organizados em alguma série. Para mover um episódio, abra o menu ⋮ dele e escolha “Editar série / episódio”.")
+                    .setPositiveButton("OK", null)
+                    .show();
+            return;
+        }
+
+        String[] labels = new String[available.size()];
+        boolean[] checked = new boolean[available.size()];
+        for (int i = 0; i < available.size(); i++) {
+            Movie m = available.get(i);
+            labels[i] = m.title + "  •  " + durationShort(m.durationMs);
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Adicionar episódios")
+                .setMultiChoiceItems(labels, checked, (d, which, isChecked) -> checked[which] = isChecked)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Continuar", (d, w) -> {
+                    List<Movie> selected = new ArrayList<>();
+                    for (int i = 0; i < available.size(); i++) if (checked[i]) selected.add(available.get(i));
+                    if (selected.isEmpty()) {
+                        Toast.makeText(this, "Nenhum episódio selecionado.", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    askBatchSeason(series, selected);
+                }).show();
+    }
+
+    private void askBatchSeason(SeriesRepository.SeriesInfo series, List<Movie> selected) {
+        EditText seasonInput = new EditText(this);
+        seasonInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        seasonInput.setSingleLine(true);
+        seasonInput.setHint("Temporada");
+        seasonInput.setText("1");
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(dp(18), 0, dp(18), 0);
+        wrap.addView(seasonInput);
+        new AlertDialog.Builder(this)
+                .setTitle("Qual temporada?")
+                .setMessage("Os itens selecionados serão numerados em sequência a partir do próximo episódio disponível. Depois você pode ajustar qualquer episódio pelo menu ⋮.")
+                .setView(wrap)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Adicionar", (d, w) -> {
+                    int season = positiveInt(seasonInput.getText().toString(), 1);
+                    int episode = seriesRepo.nextEpisode(series.id, season);
+                    for (Movie m : selected) seriesRepo.assign(m.id, series.id, season, episode++);
+                    renderPage();
+                    Toast.makeText(this, selected.size() + " episódio(s) adicionado(s).", Toast.LENGTH_SHORT).show();
+                }).show();
+    }
+
+    private void showSeriesAssignmentDialog(Movie movie) {
+        List<SeriesRepository.SeriesInfo> all = seriesRepo.getAllSeries();
+        if (all.isEmpty()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Nenhuma série criada")
+                    .setMessage("Crie uma série primeiro e depois organize este item nela.")
+                    .setNegativeButton("Cancelar", null)
+                    .setPositiveButton("Criar série", (d, w) -> showCreateSeriesDialog())
+                    .show();
+            return;
+        }
+        String[] names = new String[all.size()];
+        for (int i = 0; i < all.size(); i++) names[i] = all.get(i).name;
+        new AlertDialog.Builder(this)
+                .setTitle("Escolher série")
+                .setItems(names, (d, which) -> showSeasonEpisodeDialog(movie, all.get(which)))
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private void showSeasonEpisodeDialog(Movie movie, SeriesRepository.SeriesInfo series) {
+        SeriesRepository.Assignment current = seriesRepo.getAssignment(movie.id);
+
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(18), 0, dp(18), 0);
+
+        EditText seasonInput = new EditText(this);
+        seasonInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        seasonInput.setHint("Temporada");
+        int seasonDefault = current != null && series.id.equals(current.seriesId) ? current.season : 1;
+        seasonInput.setText(String.valueOf(seasonDefault));
+        form.addView(seasonInput);
+
+        EditText episodeInput = new EditText(this);
+        episodeInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        episodeInput.setHint("Episódio");
+        int episodeDefault = current != null && series.id.equals(current.seriesId) && current.episode > 0
+                ? current.episode : seriesRepo.nextEpisode(series.id, seasonDefault);
+        episodeInput.setText(String.valueOf(episodeDefault));
+        form.addView(episodeInput);
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle(series.name)
+                .setMessage("Defina onde este vídeo fica dentro da série.")
+                .setView(form)
+                .setPositiveButton("Salvar", (d, w) -> {
+                    int season = positiveInt(seasonInput.getText().toString(), 1);
+                    int episode = positiveInt(episodeInput.getText().toString(), 1);
+                    seriesRepo.assign(movie.id, series.id, season, episode);
+                    renderPage();
+                });
+        if (current != null) {
+            builder.setNegativeButton("Remover da série", (d, w) -> {
+                seriesRepo.unassign(movie.id);
+                renderPage();
+            });
+            builder.setNeutralButton("Cancelar", null);
+        } else {
+            builder.setNegativeButton("Cancelar", null);
+        }
+        builder.show();
+    }
+
+    private void confirmDeleteSeries(SeriesRepository.SeriesInfo series) {
+        new AlertDialog.Builder(this)
+                .setTitle("Excluir série?")
+                .setMessage("Somente o grupo “" + series.name + "” será apagado. Nenhum filme ou episódio será excluído do celular.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Excluir série", (d, w) -> {
+                    seriesRepo.deleteSeries(series.id);
+                    page = "library";
+                    updateBottomNav();
+                    renderPage();
+                }).show();
+    }
+
+    private int positiveInt(String raw, int fallback) {
+        try {
+            int value = Integer.parseInt(raw == null ? "" : raw.trim());
+            return value > 0 ? value : fallback;
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private String durationShort(long ms) {
+        if (ms <= 0) return "duração desconhecida";
+        long total = ms / 1000L;
+        long h = total / 3600L;
+        long min = (total % 3600L) / 60L;
+        if (h > 0) return h + "h " + min + "min";
+        return min + "min";
     }
 
     private void showSideMenu() {
@@ -745,10 +1065,12 @@ public class MainActivity extends Activity {
     }
 
     private void showMovieMenu(Movie m) {
+        SeriesRepository.Assignment assignment = seriesRepo.getAssignment(m.id);
         String[] options = {
                 m.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos",
                 "Renomear",
                 "Alterar capa",
+                assignment == null ? "Adicionar a uma série" : "Editar série / episódio",
                 "Zerar progresso",
                 "Excluir filme"
         };
@@ -758,7 +1080,8 @@ public class MainActivity extends Activity {
                     if (which == 0) { m.favorite = !m.favorite; repo.save(m); renderPage(); }
                     else if (which == 1) renameMovie(m);
                     else if (which == 2) pickCover(m);
-                    else if (which == 3) { m.progressMs = 0; repo.save(m); renderPage(); }
+                    else if (which == 3) showSeriesAssignmentDialog(m);
+                    else if (which == 4) { m.progressMs = 0; repo.save(m); renderPage(); }
                     else confirmDelete(m);
                 }).show();
     }
@@ -797,7 +1120,7 @@ public class MainActivity extends Activity {
                         ? "O filme será removido da biblioteca. Os arquivos originais da pasta NÃO serão apagados."
                         : "A cópia importada pelo Cine Offline será apagada do armazenamento interno do app.")
                 .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Excluir", (d, w) -> { repo.delete(m); renderPage(); })
+                .setPositiveButton("Excluir", (d, w) -> { seriesRepo.unassign(m.id); repo.delete(m); renderPage(); })
                 .show();
     }
 
@@ -823,11 +1146,19 @@ public class MainActivity extends Activity {
         subtitle.setPadding(0, dp(5), 0, dp(16));
         card.addView(subtitle);
 
+        View series = importChoiceRow("▤", "Criar série", "Crie uma série e depois adicione episódios por temporada", () -> {
+            dialog.dismiss();
+            showCreateSeriesDialog();
+        });
+        card.addView(series, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)));
+
         View library = importChoiceRow("🎬", "Adicionar pasta com vários filmes", "Selecione a pasta Filmes • cada subpasta vira um filme • sem copiar os vídeos", () -> {
             dialog.dismiss();
             pickFolder(IMPORT_LIBRARY_LINKED);
         });
-        card.addView(library, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)));
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76));
+        llp.setMargins(0, dp(9), 0, 0);
+        card.addView(library, llp);
 
         View fast = importChoiceRow("⚡", "Usar pasta original", "Para adicionar apenas um filme • não duplica o vídeo", () -> {
             dialog.dismiss();
@@ -945,192 +1276,9 @@ public class MainActivity extends Activity {
             } else {
                 askTitleAndImport(uri, pendingFolderMode, "Filme offline");
             }
-        } else if (requestCode == REQ_CATALOG_FOLDER) {
-            try {
-                int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
-                if ((flags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
-                    getContentResolver().takePersistableUriPermission(uri, flags);
-                }
-            } catch (Exception ignored) {}
-            startCatalogScan(uri);
-        } else if (requestCode == REQ_SAVE_CATALOG && pendingCatalogFile != null) {
-            saveCatalogToUri(uri);
         } else if (requestCode == REQ_COVER && pendingCoverMovie != null) {
             copyCover(uri, pendingCoverMovie);
         }
-    }
-
-    private void showContentTitleTools() {
-        new AlertDialog.Builder(this)
-                .setTitle("🎞️ Identificar pelo conteúdo")
-                .setMessage("O Cine Offline vai abrir alguns frames de cada item apenas na memória, fazer OCR local e usar os textos mais fortes como pista do título. Nenhuma imagem é salva.\n\nDepois, ele consulta o Wikidata somente para confirmar se a pista realmente corresponde a um filme ou a um episódio. O nome só é alterado com confiança alta.\n\nPara séries: se o vídeo revelar apenas o nome geral da série, o app NÃO renomeia o episódio, porque vários episódios ficariam com o mesmo nome. Ele só aplica automaticamente quando conseguir confirmar o episódio específico.\n\nA análise pode levar alguns minutos dependendo da quantidade de filmes.")
-                .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Analisar agora", (d, w) -> startContentTitleIdentification())
-                .show();
-    }
-
-    private void startContentTitleIdentification() {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setGravity(Gravity.CENTER_HORIZONTAL);
-        content.setPadding(dp(24), dp(22), dp(24), dp(16));
-
-        ProgressBar spinner = new ProgressBar(this);
-        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
-        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
-
-        TextView message = text("Preparando OCR local…", 13, false, Ui.MUTED);
-        message.setGravity(Gravity.CENTER);
-        message.setPadding(0, dp(14), 0, 0);
-        content.addView(message);
-
-        AlertDialog progress = new AlertDialog.Builder(this)
-                .setTitle("Analisando filmes e séries")
-                .setView(content)
-                .setCancelable(false)
-                .create();
-        progress.show();
-
-        executor.execute(() -> {
-            ContentTitleIdentifier.Result result = ContentTitleIdentifier.identify(
-                    getApplicationContext(), repo,
-                    txt -> runOnUiThread(() -> {
-                        if (!isFinishing()) message.setText(txt);
-                    })
-            );
-
-            runOnUiThread(() -> {
-                if (!isFinishing()) progress.dismiss();
-                if (!result.ok) {
-                    new AlertDialog.Builder(this)
-                            .setTitle("Não foi possível identificar")
-                            .setMessage(result.error)
-                            .setPositiveButton("OK", null)
-                            .show();
-                    return;
-                }
-
-                renderPage();
-                StringBuilder msg = new StringBuilder();
-                msg.append("✅ ").append(result.renamed).append(" título(s) atualizado(s).\n")
-                        .append("• ").append(result.analyzed).append(" item(ns) provisório(s) analisado(s)\n")
-                        .append("• ").append(result.confirmedMovies).append(" filme(s) confirmado(s)\n")
-                        .append("• ").append(result.confirmedEpisodes).append(" episódio(s) confirmado(s)");
-                if (result.seriesOnly > 0) {
-                    msg.append("\n• ").append(result.seriesOnly).append(" item(ns) com série reconhecida, mas episódio incerto");
-                }
-                if (result.warning != null && !result.warning.isEmpty()) {
-                    msg.append("\n\n⚠ ").append(result.warning);
-                }
-                if (result.diagnostic != null && !result.diagnostic.isEmpty()) {
-                    msg.append("\n\nDetalhes:\n").append(result.diagnostic);
-                }
-
-                new AlertDialog.Builder(this)
-                        .setTitle("Análise concluída")
-                        .setMessage(msg.toString())
-                        .setPositiveButton("OK", null)
-                        .show();
-            });
-        });
-    }
-
-    private void pickCatalogFolder() {
-        new AlertDialog.Builder(this)
-                .setTitle("Gerar catálogo pequeno")
-                .setMessage("Selecione a pasta Filmes inteira. O app NÃO copia os vídeos de 20 GB. Ele salva somente estrutura, nomes, tamanhos e pequenos trechos de arquivos como .m3u8, .json, .txt e .nfo.\n\nDepois, envie o arquivo .json gerado aqui no ChatGPT.")
-                .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Selecionar pasta", (d, w) -> {
-                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                    startActivityForResult(i, REQ_CATALOG_FOLDER);
-                })
-                .show();
-    }
-
-    private void startCatalogScan(Uri uri) {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setGravity(Gravity.CENTER_HORIZONTAL);
-        content.setPadding(dp(24), dp(22), dp(24), dp(16));
-
-        ProgressBar spinner = new ProgressBar(this);
-        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
-        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
-
-        TextView message = text("Lendo estrutura da pasta…", 13, false, Ui.MUTED);
-        message.setGravity(Gravity.CENTER);
-        message.setPadding(0, dp(14), 0, 0);
-        content.addView(message);
-
-        AlertDialog progress = new AlertDialog.Builder(this)
-                .setTitle("Criando catálogo")
-                .setView(content)
-                .setCancelable(false)
-                .create();
-        progress.show();
-
-        executor.execute(() -> {
-            try {
-                CatalogExporter.Result result = CatalogExporter.scanToCache(
-                        getApplicationContext(), uri,
-                        txt -> runOnUiThread(() -> { if (!isFinishing()) message.setText(txt); })
-                );
-                runOnUiThread(() -> {
-                    if (!isFinishing()) progress.dismiss();
-                    pendingCatalogFile = result.file;
-                    pendingCatalogSummary = result.folders + " pastas • " + result.files + " arquivos • "
-                            + result.mediaFiles + " arquivos de vídeo ignorados no conteúdo";
-                    askWhereToSaveCatalog();
-                });
-            } catch (Exception e) {
-                runOnUiThread(() -> {
-                    if (!isFinishing()) progress.dismiss();
-                    new AlertDialog.Builder(this)
-                            .setTitle("Não foi possível criar o catálogo")
-                            .setMessage(e.getMessage() == null ? e.toString() : e.getMessage())
-                            .setPositiveButton("OK", null)
-                            .show();
-                });
-            }
-        });
-    }
-
-    private void askWhereToSaveCatalog() {
-        if (pendingCatalogFile == null || !pendingCatalogFile.exists()) return;
-        new AlertDialog.Builder(this)
-                .setTitle("Catálogo criado")
-                .setMessage(pendingCatalogSummary + "\n\nO arquivo é pequeno e não contém os vídeos. Agora escolha onde salvar para depois enviar aqui.")
-                .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Salvar arquivo", (d, w) -> {
-                    Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                    i.addCategory(Intent.CATEGORY_OPENABLE);
-                    i.setType("application/json");
-                    i.putExtra(Intent.EXTRA_TITLE, pendingCatalogFile.getName());
-                    startActivityForResult(i, REQ_SAVE_CATALOG);
-                })
-                .show();
-    }
-
-    private void saveCatalogToUri(Uri uri) {
-        File source = pendingCatalogFile;
-        if (source == null || !source.exists()) return;
-        try (InputStream in = new java.io.FileInputStream(source);
-             OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
-            if (out == null) throw new Exception("Não foi possível abrir o destino.");
-            byte[] buffer = new byte[32768];
-            int n;
-            while ((n = in.read(buffer)) >= 0) if (n > 0) out.write(buffer, 0, n);
-            out.flush();
-            Toast.makeText(this, "✅ Catálogo salvo. Agora envie esse .json aqui no ChatGPT.", Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "Falha ao salvar catálogo: " + e.getMessage(), Toast.LENGTH_LONG).show();
-            return;
-        }
-        //noinspection ResultOfMethodCallIgnored
-        source.delete();
-        pendingCatalogFile = null;
-        pendingCatalogSummary = "";
     }
 
     private String defaultName(Uri uri) {
