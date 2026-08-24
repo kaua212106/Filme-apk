@@ -33,6 +33,7 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -45,6 +46,8 @@ public class MainActivity extends Activity {
     private static final int REQ_ZIP = 1001;
     private static final int REQ_FOLDER = 1002;
     private static final int REQ_COVER = 1003;
+    private static final int REQ_CATALOG_FOLDER = 1004;
+    private static final int REQ_SAVE_CATALOG = 1005;
 
     private static final int IMPORT_ZIP = 0;
     private static final int IMPORT_FOLDER_LINKED = 1;
@@ -63,6 +66,8 @@ public class MainActivity extends Activity {
     private EditText searchInput;
     private LinearLayout searchResults;
     private Movie pendingCoverMovie;
+    private File pendingCatalogFile;
+    private String pendingCatalogSummary = "";
     private int pendingFolderMode = IMPORT_FOLDER_LINKED;
     private String page = "home";
 
@@ -492,6 +497,10 @@ public class MainActivity extends Activity {
         LinearLayout quick = settingsCard("📦", "Importar filme", "Adicionar ZIP ou pasta com index.m3u8 e segmentos .dat/.ts");
         quick.setOnClickListener(v -> showImportChoice());
         pageContent.addView(quick);
+
+        LinearLayout catalog = settingsCard("🧾", "Gerar catálogo para identificação", "Lê nomes e metadados da pasta sem copiar os vídeos pesados");
+        catalog.setOnClickListener(v -> pickCatalogFolder());
+        pageContent.addView(catalog);
 
         LinearLayout fav = settingsCard("★", "Favoritos", "Abrir todos os filmes que você marcou com estrela");
         fav.setOnClickListener(v -> setPage("favorites"));
@@ -931,9 +940,117 @@ public class MainActivity extends Activity {
             } else {
                 askTitleAndImport(uri, pendingFolderMode, "Filme offline");
             }
+        } else if (requestCode == REQ_CATALOG_FOLDER) {
+            try {
+                int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+                if ((flags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                    getContentResolver().takePersistableUriPermission(uri, flags);
+                }
+            } catch (Exception ignored) {}
+            startCatalogScan(uri);
+        } else if (requestCode == REQ_SAVE_CATALOG && pendingCatalogFile != null) {
+            saveCatalogToUri(uri);
         } else if (requestCode == REQ_COVER && pendingCoverMovie != null) {
             copyCover(uri, pendingCoverMovie);
         }
+    }
+
+    private void pickCatalogFolder() {
+        new AlertDialog.Builder(this)
+                .setTitle("Gerar catálogo pequeno")
+                .setMessage("Selecione a pasta Filmes inteira. O app NÃO copia os vídeos de 20 GB. Ele salva somente estrutura, nomes, tamanhos e pequenos trechos de arquivos como .m3u8, .json, .txt e .nfo.\n\nDepois, envie o arquivo .json gerado aqui no ChatGPT.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Selecionar pasta", (d, w) -> {
+                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                    startActivityForResult(i, REQ_CATALOG_FOLDER);
+                })
+                .show();
+    }
+
+    private void startCatalogScan(Uri uri) {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(24), dp(22), dp(24), dp(16));
+
+        ProgressBar spinner = new ProgressBar(this);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
+        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        TextView message = text("Lendo estrutura da pasta…", 13, false, Ui.MUTED);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, dp(14), 0, 0);
+        content.addView(message);
+
+        AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("Criando catálogo")
+                .setView(content)
+                .setCancelable(false)
+                .create();
+        progress.show();
+
+        executor.execute(() -> {
+            try {
+                CatalogExporter.Result result = CatalogExporter.scanToCache(
+                        getApplicationContext(), uri,
+                        txt -> runOnUiThread(() -> { if (!isFinishing()) message.setText(txt); })
+                );
+                runOnUiThread(() -> {
+                    if (!isFinishing()) progress.dismiss();
+                    pendingCatalogFile = result.file;
+                    pendingCatalogSummary = result.folders + " pastas • " + result.files + " arquivos • "
+                            + result.mediaFiles + " arquivos de vídeo ignorados no conteúdo";
+                    askWhereToSaveCatalog();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!isFinishing()) progress.dismiss();
+                    new AlertDialog.Builder(this)
+                            .setTitle("Não foi possível criar o catálogo")
+                            .setMessage(e.getMessage() == null ? e.toString() : e.getMessage())
+                            .setPositiveButton("OK", null)
+                            .show();
+                });
+            }
+        });
+    }
+
+    private void askWhereToSaveCatalog() {
+        if (pendingCatalogFile == null || !pendingCatalogFile.exists()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("Catálogo criado")
+                .setMessage(pendingCatalogSummary + "\n\nO arquivo é pequeno e não contém os vídeos. Agora escolha onde salvar para depois enviar aqui.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Salvar arquivo", (d, w) -> {
+                    Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                    i.addCategory(Intent.CATEGORY_OPENABLE);
+                    i.setType("application/json");
+                    i.putExtra(Intent.EXTRA_TITLE, pendingCatalogFile.getName());
+                    startActivityForResult(i, REQ_SAVE_CATALOG);
+                })
+                .show();
+    }
+
+    private void saveCatalogToUri(Uri uri) {
+        File source = pendingCatalogFile;
+        if (source == null || !source.exists()) return;
+        try (InputStream in = new java.io.FileInputStream(source);
+             OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
+            if (out == null) throw new Exception("Não foi possível abrir o destino.");
+            byte[] buffer = new byte[32768];
+            int n;
+            while ((n = in.read(buffer)) >= 0) if (n > 0) out.write(buffer, 0, n);
+            out.flush();
+            Toast.makeText(this, "✅ Catálogo salvo. Agora envie esse .json aqui no ChatGPT.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Falha ao salvar catálogo: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            return;
+        }
+        //noinspection ResultOfMethodCallIgnored
+        source.delete();
+        pendingCatalogFile = null;
+        pendingCatalogSummary = "";
     }
 
     private String defaultName(Uri uri) {
