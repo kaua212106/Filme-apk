@@ -36,6 +36,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Identificação conservadora pelo próprio conteúdo do vídeo.
@@ -87,9 +89,12 @@ public class ContentTitleIdentifier {
     }
 
     private static final double[] SAMPLE_POSITIONS = {
-            0.005, 0.015, 0.03, 0.06, 0.10, 0.16, 0.25
+            0.002, 0.006, 0.012, 0.022, 0.04, 0.07, 0.11, 0.17,
+            0.28, 0.46, 0.63,
+            0.84, 0.93, 0.972, 0.992
     };
-    private static final int MAX_CANDIDATES_TO_LOOKUP = 4;
+    private static final int MAX_CANDIDATES_TO_LOOKUP = 5;
+    private static final int MAX_WEB_PHRASES = 2;
     private static final int CONNECT_TIMEOUT = 7000;
     private static final int READ_TIMEOUT = 9000;
 
@@ -205,6 +210,18 @@ public class ContentTitleIdentifier {
                     if (!("film".equals(m.kind) || "episode".equals(m.kind))) continue;
                     if (m.confidence < 0.86) continue;
                     if (best == null || m.confidence > best.confidence) best = m;
+                }
+
+                if (best == null) {
+                    Match web = lookupByWebSearch(
+                            candidates,
+                            movie.playlistPath,
+                            out,
+                            listener,
+                            i + 1,
+                            pending.size()
+                    );
+                    if (web != null) best = web;
                 }
 
                 if (best != null) {
@@ -505,6 +522,254 @@ public class ContentTitleIdentifier {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+
+    private static Match lookupByWebSearch(List<CandidateStat> candidates,
+                                           String playlistPath,
+                                           Result out,
+                                           ProgressListener listener,
+                                           int itemNumber,
+                                           int totalItems) {
+        if (candidates == null || candidates.isEmpty()) return null;
+
+        double durationMinutes = playlistDurationMinutes(playlistPath);
+        String hint;
+        if (durationMinutes > 0 && durationMinutes <= 68) hint = "episódio série";
+        else if (durationMinutes >= 75) hint = "filme";
+        else hint = "filme série episódio";
+
+        Map<String, WebVote> votes = new LinkedHashMap<>();
+        int used = 0;
+
+        for (CandidateStat c : candidates) {
+            if (used >= MAX_WEB_PHRASES) break;
+            String phrase = sanitizeOcr(c.raw);
+            if (!isUsefulWebPhrase(phrase)) continue;
+            used++;
+
+            progress(listener, "🌐 " + itemNumber + "/" + totalItems
+                    + " • cruzando a frase “" + shortText(phrase, 30) + "”");
+
+            List<String> titles = searchDuckDuckGoTitles(phrase, hint);
+            out.networkQueries++;
+
+            String picked = "";
+            boolean pickedTrusted = false;
+            for (String title : titles) {
+                String cleaned = cleanSearchResultTitle(title);
+                if (!isPlausibleResultTitle(cleaned)) continue;
+                boolean trusted = trustedSearchHeading(title);
+                if (picked.isEmpty() || trusted) {
+                    picked = cleaned;
+                    pickedTrusted = trusted;
+                }
+                if (trusted) break;
+            }
+            if (picked.isEmpty()) continue;
+
+            String key = normalize(picked);
+            WebVote v = votes.get(key);
+            if (v == null) {
+                v = new WebVote();
+                v.rawLabel = picked;
+                votes.put(key, v);
+            }
+            if (v.phrases.add(normalize(phrase))) v.support++;
+            if (pickedTrusted) v.trustedHits++;
+            v.bestPhraseLength = Math.max(v.bestPhraseLength, phrase.length());
+        }
+
+        WebVote winner = null;
+        for (WebVote v : votes.values()) {
+            if (winner == null
+                    || v.support > winner.support
+                    || (v.support == winner.support && v.trustedHits > winner.trustedHits)) {
+                winner = v;
+            }
+        }
+        if (winner == null) return null;
+
+        // Duas frases diferentes apontando para o mesmo título é a melhor evidência.
+        if (winner.support >= 2 && winner.trustedHits >= 1) {
+            Match m = new Match();
+            m.label = winner.rawLabel;
+            m.description = "confirmado por duas frases OCR em resultados de busca";
+            m.kind = durationMinutes > 0 && durationMinutes <= 68 ? "episode" : "film";
+            m.confidence = 0.93;
+            return m;
+        }
+
+        // Se só uma frase encontrou algo, fazemos UMA confirmação no Wikidata.
+        // Assim a versão 3.6 não dispara centenas de requisições por filme.
+        if (winner.support == 1 && winner.trustedHits >= 1 && winner.bestPhraseLength >= 18) {
+            Match verified = lookupWikidata(winner.rawLabel);
+            out.networkQueries++;
+            if (verified != null
+                    && ("film".equals(verified.kind) || "episode".equals(verified.kind))
+                    && verified.confidence >= 0.88) {
+                return verified;
+            }
+        }
+        return null;
+    }
+
+    private static class WebVote {
+        String rawLabel;
+        int support;
+        int trustedHits;
+        int bestPhraseLength;
+        Set<String> phrases = new HashSet<>();
+    }
+
+    private static boolean isUsefulWebPhrase(String value) {
+        String s = sanitizeOcr(value);
+        String n = normalize(s);
+        if (s.length() < 7 || s.length() > 72) return false;
+        if (n.matches(".*\\b\\d{4}\\b.*") && s.length() < 16) return false;
+        if (containsAny(n,
+                "netflix", "prime video", "amazon", "disney", "paramount",
+                "hbo", "copyright", "legendado", "dublado", "www", "http",
+                "produzido por", "direcao", "direção", "roteiro", "elenco")) return false;
+
+        int letters = 0, words = 0;
+        for (int i = 0; i < s.length(); i++) if (Character.isLetter(s.charAt(i))) letters++;
+        String[] parts = n.split("\\s+");
+        for (String part : parts) if (part.length() >= 2) words++;
+        return letters >= 6 && words >= 2;
+    }
+
+    private static List<String> searchDuckDuckGoTitles(String phrase, String hint) {
+        List<String> out = new ArrayList<>();
+        HttpURLConnection c = null;
+        try {
+            String q = "\"" + phrase + "\" " + hint;
+            String u = "https://html.duckduckgo.com/html/?q="
+                    + URLEncoder.encode(q, StandardCharsets.UTF_8.name());
+            c = (HttpURLConnection) new URL(u).openConnection();
+            c.setConnectTimeout(CONNECT_TIMEOUT);
+            c.setReadTimeout(READ_TIMEOUT);
+            c.setInstanceFollowRedirects(true);
+            c.setRequestProperty("Accept", "text/html,application/xhtml+xml");
+            c.setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.7");
+            c.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+                            + "(KHTML, like Gecko) Chrome/124 Mobile Safari/537.36");
+            int code = c.getResponseCode();
+            if (code < 200 || code >= 400) return out;
+            String body = readAll(c.getInputStream());
+            if (body == null || body.isEmpty()) return out;
+
+            Pattern p = Pattern.compile(
+                    "<a[^>]*class=[\\\"'][^\\\"']*result__a[^\\\"']*[\\\"'][^>]*>(.*?)</a>",
+                    Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+            );
+            Matcher m = p.matcher(body);
+            while (m.find() && out.size() < 8) {
+                String t = htmlToText(m.group(1));
+                if (!t.isEmpty()) out.add(t);
+            }
+
+            if (out.isEmpty()) {
+                Pattern p2 = Pattern.compile(
+                        "<a[^>]*>([^<]{4,140})</a>",
+                        Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+                );
+                Matcher m2 = p2.matcher(body);
+                while (m2.find() && out.size() < 8) {
+                    String t = htmlToText(m2.group(1));
+                    if (trustedSearchHeading(t)) out.add(t);
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) try { c.disconnect(); } catch (Exception ignored) {}
+        }
+        return out;
+    }
+
+    private static String htmlToText(String value) {
+        if (value == null) return "";
+        String s = value.replaceAll("<[^>]+>", " ");
+        s = s.replace("&amp;", "&")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&#x27;", "'")
+                .replace("&apos;", "'")
+                .replace("&nbsp;", " ")
+                .replace("&ndash;", "-")
+                .replace("&mdash;", "-")
+                .replace("&middot;", "·");
+        Matcher m = Pattern.compile("&#(\\d+);").matcher(s);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            try {
+                int cp = Integer.parseInt(m.group(1));
+                m.appendReplacement(sb, Matcher.quoteReplacement(new String(Character.toChars(cp))));
+            } catch (Exception e) {
+                m.appendReplacement(sb, " ");
+            }
+        }
+        m.appendTail(sb);
+        return sanitizeOcr(sb.toString());
+    }
+
+    private static boolean trustedSearchHeading(String title) {
+        String n = normalize(title);
+        return containsAny(n,
+                "imdb", "wikipedia", "wikipédia", "the movie database", "tmdb",
+                "rottentomatoes", "fandom", "tvmaze",
+                "episode", "episodio", "episódio", "subtitles", "legendas", "transcript");
+    }
+
+    private static String cleanSearchResultTitle(String value) {
+        String s = sanitizeOcr(value);
+        if (s.isEmpty()) return s;
+
+        s = s.replaceAll("(?i)\\s*[|–—-]\\s*(IMDb|Wikipedia|Wikipédia|TMDB|The Movie Database|Rotten Tomatoes).*$", "");
+        s = s.replaceAll("(?i)\\s*[|–—-]\\s*(subtitles?|legendas?|transcripts?|transcrição).*$", "");
+        s = s.replaceAll("(?i)^watch\\s+", "");
+        s = s.replaceAll("(?i)^assistir\\s+", "");
+        s = s.replaceAll("(?i)\\s*\\((?:19|20)\\d{2}\\)\\s*$", "");
+        s = s.replaceAll("\\s+", " ").trim();
+
+        int pipe = s.indexOf(" | ");
+        if (pipe > 2) s = s.substring(0, pipe).trim();
+
+        return cleanDisplayTitle(s);
+    }
+
+    private static boolean isPlausibleResultTitle(String value) {
+        String s = cleanDisplayTitle(value);
+        if (s.length() < 2 || s.length() > 100) return false;
+        String n = normalize(s);
+        if (containsAny(n,
+                "search results", "resultados da pesquisa", "duckduckgo",
+                "download subtitles", "baixar legendas", "transcript search")) return false;
+        int letters = 0;
+        for (int i = 0; i < s.length(); i++) if (Character.isLetter(s.charAt(i))) letters++;
+        return letters >= 2;
+    }
+
+    private static double playlistDurationMinutes(String playlistPath) {
+        if (playlistPath == null || playlistPath.trim().isEmpty()) return -1;
+        java.io.File f = new java.io.File(playlistPath);
+        if (!f.exists()) return -1;
+        double seconds = 0;
+        try (BufferedReader br = new BufferedReader(new java.io.FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (!line.startsWith("#EXTINF:")) continue;
+                String x = line.substring(8);
+                int comma = x.indexOf(',');
+                if (comma >= 0) x = x.substring(0, comma);
+                try { seconds += Double.parseDouble(x.trim()); } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {
+            return -1;
+        }
+        return seconds > 0 ? seconds / 60.0 : -1;
     }
 
     private static String mediaKind(String description) {
