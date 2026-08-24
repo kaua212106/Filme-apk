@@ -17,6 +17,7 @@ import android.widget.Toast;
 
 import androidx.annotation.Nullable;
 import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
@@ -80,7 +81,7 @@ public class PlayerActivity extends Activity {
         TextView title = text(movie.title, 17, true, Color.WHITE);
         title.setSingleLine(true);
         titles.addView(title);
-        TextView local = text("● Reprodução local", 10, false, Color.rgb(168, 231, 208));
+        TextView local = text(movie.isLinked() ? "⚡ Pasta original • sem cópia" : "● Cópia local", 10, false, Color.rgb(168, 231, 208));
         titles.addView(local);
         topBar.addView(titles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
@@ -164,7 +165,11 @@ public class PlayerActivity extends Activity {
                 .setSeekForwardIncrementMs(10_000)
                 .build();
         playerView.setPlayer(player);
-        player.setMediaItem(MediaItem.fromUri(Uri.fromFile(playlist)));
+        MediaItem item = new MediaItem.Builder()
+                .setUri(Uri.fromFile(playlist))
+                .setMimeType(MimeTypes.APPLICATION_M3U8)
+                .build();
+        player.setMediaItem(item);
         player.addListener(new Player.Listener() {
             @Override
             public void onPlaybackStateChanged(int playbackState) {
@@ -183,7 +188,17 @@ public class PlayerActivity extends Activity {
 
             @Override
             public void onPlayerError(PlaybackException error) {
-                Toast.makeText(PlayerActivity.this, "Erro na reprodução: " + error.getErrorCodeName(), Toast.LENGTH_LONG).show();
+                String message;
+                if (movie.isLinked()) {
+                    message = "Não consegui acessar os arquivos originais. Verifique se a pasta ainda existe no mesmo lugar e se o Android manteve a permissão de acesso.";
+                } else {
+                    message = "Erro na reprodução: " + error.getErrorCodeName();
+                }
+                new AlertDialog.Builder(PlayerActivity.this)
+                        .setTitle("Não foi possível reproduzir")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show();
             }
         });
         player.prepare();

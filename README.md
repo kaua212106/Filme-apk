@@ -1,42 +1,20 @@
-# Cine Offline 2.0
+# Cine Offline 3.2
 
-Versão visual refeita para combinar com o estilo dos outros apps: gradiente roxo/azul, cartões arredondados, menu lateral, busca, barra inferior e capa automática.
+Versão com **importação rápida por pasta**, mantendo o visual da versão 3.1.
 
-## Arquivos na raiz
-- AndroidManifest.xml
-- MainActivity.java
-- PlayerActivity.java
-- Movie.java
-- MovieRepository.java
-- MovieImporter.java
-- ImportResult.java
-- Ui.java
-- build.gradle
-- settings.gradle
-- gradle.properties
-- icone.png
+## Novidades 3.2
+- ⚡ **Usar pasta original**: cadastra o filme sem copiar centenas de MB para o app.
+- 📥 **Copiar pasta para o app**: mantém o modo seguro antigo para quem quer apagar/mover os arquivos originais depois.
+- 📦 ZIP continua disponível, agora com buffer maior e progresso aproximado em porcentagem.
+- 🖼️ A capa automática é criada em segundo plano, depois que o filme já aparece na biblioteca.
+- 🗑️ No modo rápido, excluir o filme da biblioteca não apaga os arquivos originais.
+- ▶️ Player identifica o modo rápido e mostra uma mensagem mais clara se a pasta original tiver sido movida ou a permissão tiver sido perdida.
 
-O workflow `build-apk.yml` continua igual e deve ficar em `.github/workflows/build-apk.yml`.
+## Importante sobre o modo rápido
+O Cine Offline guarda permissão de leitura da pasta escolhida. Para continuar reproduzindo:
+- não apague a pasta original;
+- não mova/renomeie a pasta ou os segmentos depois de adicionar;
+- se o Android não permitir selecionar uma pasta dentro de `Android/data`, mova a pasta do filme para um local selecionável, como Downloads/Movies, ou use a importação por ZIP.
 
-## Recursos
-- Importação por ZIP ou pasta
-- index.m3u8 + .dat/.ts
-- Reprodução 100% local depois da importação
-- Capa automática extraída do próprio vídeo
-- Capa personalizada
-- Busca
-- Favoritos
-- Histórico
-- Continuar de onde parou
-- Progresso visual
-- Velocidades de 0,5x a 2x
-- Voltar/avançar 10 segundos
-- Reiniciar vídeo
-- Tela cheia
-- Rotação
-- Renomear e excluir filmes
-
-
-### Correções 3.1
-- Janela de importação refeita com botões visíveis em qualquer tema Android.
-- Contadores da tela inicial reduzidos e unidos em uma barra compacta.
+## Arquivos na raiz do GitHub
+O projeto continua achatado, sem pastas internas no ZIP. O `build-apk.yml` deve continuar em `.github/workflows/build-apk.yml` no GitHub.

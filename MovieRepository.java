@@ -1,7 +1,9 @@
 package com.offlineplayer.cineoffline;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -9,16 +11,17 @@ import org.json.JSONObject;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 
 public class MovieRepository {
     private static final String PREF = "cine_offline_db";
     private static final String KEY = "movies";
     private final SharedPreferences prefs;
+    private final Context appContext;
 
     public MovieRepository(Context context) {
-        prefs = context.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+        appContext = context.getApplicationContext();
+        prefs = appContext.getSharedPreferences(PREF, Context.MODE_PRIVATE);
     }
 
     public synchronized List<Movie> getAll() {
@@ -58,7 +61,26 @@ public class MovieRepository {
         List<Movie> list = getAll();
         list.removeIf(m -> m.id.equals(movie.id));
         persist(list);
+
+        // folderPath é sempre a pasta privada do Cine Offline, inclusive no modo rápido.
+        // Os vídeos originais nunca são apagados no modo linked.
         deleteRecursive(new File(movie.folderPath));
+
+        if (movie.isLinked() && movie.sourceUri != null && !movie.sourceUri.isEmpty()) {
+            boolean stillUsed = false;
+            for (Movie m : list) {
+                if (m.isLinked() && movie.sourceUri.equals(m.sourceUri)) {
+                    stillUsed = true;
+                    break;
+                }
+            }
+            if (!stillUsed) {
+                try {
+                    appContext.getContentResolver().releasePersistableUriPermission(
+                            Uri.parse(movie.sourceUri), Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Exception ignored) {}
+            }
+        }
     }
 
     private void persist(List<Movie> list) {

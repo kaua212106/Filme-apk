@@ -46,6 +46,10 @@ public class MainActivity extends Activity {
     private static final int REQ_FOLDER = 1002;
     private static final int REQ_COVER = 1003;
 
+    private static final int IMPORT_ZIP = 0;
+    private static final int IMPORT_FOLDER_LINKED = 1;
+    private static final int IMPORT_FOLDER_COPIED = 2;
+
     private MovieRepository repo;
     private LinearLayout pageContent;
     private LinearLayout bottomNav;
@@ -58,6 +62,7 @@ public class MainActivity extends Activity {
     private EditText searchInput;
     private LinearLayout searchResults;
     private Movie pendingCoverMovie;
+    private int pendingFolderMode = IMPORT_FOLDER_LINKED;
     private String page = "home";
 
     @Override
@@ -773,7 +778,9 @@ public class MainActivity extends Activity {
     private void confirmDelete(Movie m) {
         new AlertDialog.Builder(this)
                 .setTitle("Excluir filme?")
-                .setMessage("A cópia importada pelo Cine Offline será apagada do armazenamento interno do app.")
+                .setMessage(m.isLinked()
+                        ? "O filme será removido da biblioteca. Os arquivos originais da pasta NÃO serão apagados."
+                        : "A cópia importada pelo Cine Offline será apagada do armazenamento interno do app.")
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Excluir", (d, w) -> { repo.delete(m); renderPage(); })
                 .show();
@@ -786,7 +793,6 @@ public class MainActivity extends Activity {
     }
 
     private void showImportChoice() {
-        // Dialog próprio: em alguns aparelhos o AlertDialog.setItems deixava as opções invisíveis.
         final Dialog dialog = new Dialog(this);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
@@ -798,29 +804,41 @@ public class MainActivity extends Activity {
         TextView title = text("Adicionar filme", 20, true, Ui.TEXT);
         card.addView(title);
 
-        TextView subtitle = text("Escolha de onde o Cine Offline deve importar o filme.", 12, false, Ui.MUTED);
+        TextView subtitle = text("Escolha como adicionar. O modo rápido não copia o vídeo e costuma terminar em poucos segundos.", 12, false, Ui.MUTED);
         subtitle.setPadding(0, dp(5), 0, dp(16));
         card.addView(subtitle);
 
-        View zip = importChoiceRow("📦", "Importar ZIP", "Selecione um ZIP com index.m3u8 e os arquivos .dat/.ts", () -> {
+        View fast = importChoiceRow("⚡", "Usar pasta original", "Mais rápido • não duplica o filme • mantenha a pasta no mesmo lugar", () -> {
+            dialog.dismiss();
+            pickFolder(IMPORT_FOLDER_LINKED);
+        });
+        card.addView(fast, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)));
+
+        View safe = importChoiceRow("📥", "Copiar pasta para o app", "Mais seguro • pode apagar/mover a pasta original depois • demora mais", () -> {
+            dialog.dismiss();
+            pickFolder(IMPORT_FOLDER_COPIED);
+        });
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76));
+        slp.setMargins(0, dp(9), 0, 0);
+        card.addView(safe, slp);
+
+        View zip = importChoiceRow("📦", "Importar ZIP", "Extrai o ZIP para o Cine Offline • mostra o progresso da importação", () -> {
             dialog.dismiss();
             pickZip();
         });
-        card.addView(zip, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72)));
+        LinearLayout.LayoutParams zlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76));
+        zlp.setMargins(0, dp(9), 0, 0);
+        card.addView(zip, zlp);
 
-        View folder = importChoiceRow("📁", "Importar pasta", "Selecione diretamente a pasta onde o filme está salvo", () -> {
-            dialog.dismiss();
-            pickFolder();
-        });
-        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
-        flp.setMargins(0, dp(10), 0, 0);
-        card.addView(folder, flp);
+        TextView note = text("Dica: para filmes grandes, prefira ⚡ Usar pasta original.", 10, false, Ui.MUTED);
+        note.setPadding(dp(4), dp(10), dp(4), 0);
+        card.addView(note);
 
         TextView cancel = text("Cancelar", 12, true, Ui.MUTED);
         cancel.setGravity(Gravity.CENTER);
         cancel.setOnClickListener(v -> dialog.dismiss());
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
-        clp.setMargins(0, dp(8), 0, 0);
+        clp.setMargins(0, dp(6), 0, 0);
         card.addView(cancel, clp);
 
         dialog.setContentView(card);
@@ -874,7 +892,8 @@ public class MainActivity extends Activity {
         startActivityForResult(i, REQ_ZIP);
     }
 
-    private void pickFolder() {
+    private void pickFolder(int mode) {
+        pendingFolderMode = mode;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         startActivityForResult(i, REQ_FOLDER);
@@ -887,13 +906,18 @@ public class MainActivity extends Activity {
         Uri uri = data.getData();
 
         if (requestCode == REQ_ZIP) {
-            askTitleAndImport(uri, false, defaultName(uri));
+            askTitleAndImport(uri, IMPORT_ZIP, defaultName(uri));
         } else if (requestCode == REQ_FOLDER) {
-            try {
-                int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
-                getContentResolver().takePersistableUriPermission(uri, flags);
-            } catch (Exception ignored) {}
-            askTitleAndImport(uri, true, "Filme offline");
+            // Só o modo rápido precisa manter acesso permanente à pasta original.
+            if (pendingFolderMode == IMPORT_FOLDER_LINKED) {
+                try {
+                    int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+                    if ((flags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                        getContentResolver().takePersistableUriPermission(uri, flags);
+                    }
+                } catch (Exception ignored) {}
+            }
+            askTitleAndImport(uri, pendingFolderMode, "Filme offline");
         } else if (requestCode == REQ_COVER && pendingCoverMovie != null) {
             copyCover(uri, pendingCoverMovie);
         }
@@ -911,7 +935,7 @@ public class MainActivity extends Activity {
         return name;
     }
 
-    private void askTitleAndImport(Uri uri, boolean folder, String defaultTitle) {
+    private void askTitleAndImport(Uri uri, int mode, String defaultTitle) {
         EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setText(defaultTitle);
@@ -919,16 +943,22 @@ public class MainActivity extends Activity {
         FrameLayout wrap = new FrameLayout(this);
         wrap.setPadding(dp(18), 0, dp(18), 0);
         wrap.addView(input);
+
+        String modeText;
+        if (mode == IMPORT_FOLDER_LINKED) modeText = "⚡ Modo rápido: o filme será usado direto da pasta original, sem criar outra cópia.";
+        else if (mode == IMPORT_FOLDER_COPIED) modeText = "📥 Modo seguro: os arquivos serão copiados para o Cine Offline.";
+        else modeText = "📦 O ZIP será extraído para o armazenamento do Cine Offline.";
+
         new AlertDialog.Builder(this)
                 .setTitle("Nome do filme")
-                .setMessage("Você pode mudar esse nome depois.")
+                .setMessage(modeText + "\n\nVocê pode mudar o nome depois.")
                 .setView(wrap)
                 .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Importar", (d, w) -> startImport(uri, folder, input.getText().toString()))
+                .setPositiveButton("Adicionar", (d, w) -> startImport(uri, mode, input.getText().toString()))
                 .show();
     }
 
-    private void startImport(Uri uri, boolean folder, String title) {
+    private void startImport(Uri uri, int mode, String title) {
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -936,13 +966,14 @@ public class MainActivity extends Activity {
         ProgressBar spinner = new ProgressBar(this);
         spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
         content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        TextView message = text("Preparando…", 13, false, Ui.MUTED);
+        TextView message = text(mode == IMPORT_FOLDER_LINKED ? "⚡ Indexando sem copiar…" : "Preparando…", 13, false, Ui.MUTED);
         message.setGravity(Gravity.CENTER);
         message.setPadding(0, dp(14), 0, 0);
         content.addView(message);
 
+        String dialogTitle = mode == IMPORT_FOLDER_LINKED ? "Adicionando em modo rápido" : "Importando filme";
         AlertDialog progress = new AlertDialog.Builder(this)
-                .setTitle("Importando filme")
+                .setTitle(dialogTitle)
                 .setView(content)
                 .setCancelable(false)
                 .create();
@@ -950,9 +981,15 @@ public class MainActivity extends Activity {
 
         executor.execute(() -> {
             MovieImporter.ProgressListener listener = txt -> runOnUiThread(() -> message.setText(txt));
-            ImportResult result = folder
-                    ? MovieImporter.importFolder(getApplicationContext(), uri, title, listener)
-                    : MovieImporter.importZip(getApplicationContext(), uri, title, listener);
+            ImportResult result;
+            if (mode == IMPORT_FOLDER_LINKED) {
+                result = MovieImporter.importFolderLinked(getApplicationContext(), uri, title, listener);
+            } else if (mode == IMPORT_FOLDER_COPIED) {
+                result = MovieImporter.importFolderCopied(getApplicationContext(), uri, title, listener);
+            } else {
+                result = MovieImporter.importZip(getApplicationContext(), uri, title, listener);
+            }
+
             runOnUiThread(() -> {
                 if (!isFinishing()) progress.dismiss();
                 if (result.ok) {
@@ -960,11 +997,37 @@ public class MainActivity extends Activity {
                     page = "library";
                     updateBottomNav();
                     renderPage();
-                    Toast.makeText(this, "Filme importado e pronto para assistir offline.", Toast.LENGTH_LONG).show();
+
+                    if (result.movie.isLinked()) {
+                        Toast.makeText(this, "⚡ Filme adicionado sem copiar. Mantenha a pasta original no mesmo lugar.", Toast.LENGTH_LONG).show();
+                    } else {
+                        Toast.makeText(this, "Filme importado e pronto para assistir offline.", Toast.LENGTH_LONG).show();
+                    }
+
+                    // A capa automática é criada DEPOIS que o filme já entrou na biblioteca.
+                    // Assim ela não deixa a tela de importação presa por vários segundos.
+                    createCoverInBackground(result.movie);
                 } else {
-                    new AlertDialog.Builder(this).setTitle("Não foi possível importar").setMessage(result.error).setPositiveButton("OK", null).show();
+                    new AlertDialog.Builder(this)
+                            .setTitle("Não foi possível importar")
+                            .setMessage(result.error)
+                            .setPositiveButton("OK", null)
+                            .show();
                 }
             });
+        });
+    }
+
+    private void createCoverInBackground(Movie movie) {
+        File cover = new File(movie.folderPath, "cover.jpg");
+        if (cover.exists() && cover.length() > 0) return;
+        executor.execute(() -> {
+            boolean created = MovieImporter.createAutomaticCover(getApplicationContext(), movie);
+            if (created) {
+                runOnUiThread(() -> {
+                    if (!isFinishing() && pageContent != null) renderPage();
+                });
+            }
         });
     }
 
