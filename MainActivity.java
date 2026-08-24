@@ -2,23 +2,31 @@ package com.offlineplayer.cineoffline;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.ProgressDialog;
+import android.app.Dialog;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.PopupMenu;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -27,6 +35,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -41,14 +51,21 @@ public class MainActivity extends Activity {
     private LinearLayout movieList;
     private TextView pageTitle;
     private TextView pageSubtitle;
-    private TextView stats;
+    private TextView statMovies;
+    private TextView statContinue;
+    private TextView statFavorites;
+    private EditText search;
     private String filter = "all";
     private Movie pendingCoverMovie;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final List<TextView> navButtons = new ArrayList<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().setStatusBarColor(Ui.BG);
+        getWindow().setNavigationBarColor(Ui.BG);
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
         repo = new MovieRepository(this);
         buildUi();
         refresh();
@@ -69,105 +86,248 @@ public class MainActivity extends Activity {
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(14), dp(16), dp(16));
-        root.setBackgroundColor(Color.rgb(246, 247, 251));
+        root.setBackgroundColor(Ui.BG);
+        root.setPadding(dp(14), statusBarHeight() + dp(10), dp(14), Math.max(dp(10), navigationBarHeight()));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setPadding(dp(14), dp(12), dp(14), dp(15));
+        header.setBackground(Ui.gradient(this, 28));
+        header.setElevation(dp(5));
 
         LinearLayout top = new LinearLayout(this);
         top.setGravity(Gravity.CENTER_VERTICAL);
 
-        Button menu = compactButton("☰");
-        menu.setOnClickListener(this::showMenu);
-        top.addView(menu, new LinearLayout.LayoutParams(dp(52), dp(48)));
+        TextView menu = iconButton("☰");
+        menu.setOnClickListener(v -> showSideMenu());
+        top.addView(menu, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.icone);
+        logo.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        LinearLayout.LayoutParams lpLogo = new LinearLayout.LayoutParams(dp(42), dp(42));
+        lpLogo.setMargins(dp(10), 0, dp(10), 0);
+        top.addView(logo, lpLogo);
 
         LinearLayout titles = new LinearLayout(this);
         titles.setOrientation(LinearLayout.VERTICAL);
-        titles.setPadding(dp(10), 0, dp(10), 0);
-        pageTitle = text("Cine Offline", 22, true, Color.rgb(32, 40, 58));
-        pageSubtitle = text("Sua biblioteca local", 13, false, Color.DKGRAY);
+        pageTitle = text("Cine Offline", 22, true, Color.WHITE);
+        pageSubtitle = text("Sua biblioteca local", 12, false, Color.argb(220, 255, 255, 255));
         titles.addView(pageTitle);
         titles.addView(pageSubtitle);
-        top.addView(titles, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        top.addView(titles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
-        Button add = compactButton("+");
-        add.setTextSize(27);
+        TextView offline = text("● OFFLINE", 10, true, Color.WHITE);
+        offline.setGravity(Gravity.CENTER);
+        offline.setBackground(Ui.rounded(Color.argb(42,255,255,255), 13, this));
+        top.addView(offline, new LinearLayout.LayoutParams(dp(78), dp(32)));
+
+        TextView add = iconButton("＋");
+        LinearLayout.LayoutParams addLp = new LinearLayout.LayoutParams(dp(48), dp(48));
+        addLp.setMargins(dp(8), 0, 0, 0);
         add.setOnClickListener(v -> showImportChoice());
-        top.addView(add, new LinearLayout.LayoutParams(dp(52), dp(48)));
-        root.addView(top);
+        top.addView(add, addLp);
+        header.addView(top);
 
-        stats = text("0 filmes  •  0 continuar  •  0 favoritos", 14, true, Color.rgb(74, 85, 104));
-        stats.setPadding(dp(4), dp(18), dp(4), dp(12));
+        TextView hero = text("Seus filmes, mesmo sem internet.", 15, true, Color.WHITE);
+        hero.setPadding(dp(4), dp(12), 0, 0);
+        header.addView(hero);
+        root.addView(header);
+
+        LinearLayout searchBox = new LinearLayout(this);
+        searchBox.setGravity(Gravity.CENTER_VERTICAL);
+        searchBox.setPadding(dp(14), 0, dp(12), 0);
+        Ui.card(searchBox, this, 18);
+        LinearLayout.LayoutParams sbp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        sbp.setMargins(0, dp(12), 0, 0);
+
+        TextView searchIcon = text("⌕", 25, false, Ui.MUTED);
+        searchBox.addView(searchIcon, new LinearLayout.LayoutParams(dp(30), ViewGroup.LayoutParams.MATCH_PARENT));
+        search = new EditText(this);
+        search.setHint("Buscar na biblioteca");
+        search.setHintTextColor(Color.rgb(155, 160, 180));
+        search.setTextColor(Ui.TEXT);
+        search.setTextSize(15);
+        search.setSingleLine(true);
+        search.setBackgroundColor(Color.TRANSPARENT);
+        search.setPadding(dp(8), 0, 0, 0);
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { refresh(); }
+            @Override public void afterTextChanged(Editable s) {}
+        });
+        searchBox.addView(search, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
+        root.addView(searchBox, sbp);
+
+        LinearLayout stats = new LinearLayout(this);
+        stats.setOrientation(LinearLayout.HORIZONTAL);
+        stats.setGravity(Gravity.CENTER);
+        stats.setPadding(0, dp(10), 0, dp(8));
+        statMovies = statCard(stats, "0", "Filmes", "▣");
+        statContinue = statCard(stats, "0", "Continuar", "▶");
+        statFavorites = statCard(stats, "0", "Favoritos", "★");
         root.addView(stats);
-
-        LinearLayout chips = new LinearLayout(this);
-        chips.setOrientation(LinearLayout.HORIZONTAL);
-        chips.addView(filterButton("Biblioteca", "all"), new LinearLayout.LayoutParams(0, dp(44), 1));
-        chips.addView(filterButton("Continuar", "continue"), new LinearLayout.LayoutParams(0, dp(44), 1));
-        chips.addView(filterButton("Favoritos", "favorites"), new LinearLayout.LayoutParams(0, dp(44), 1));
-        root.addView(chips);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
+        scroll.setClipToPadding(false);
         movieList = new LinearLayout(this);
         movieList.setOrientation(LinearLayout.VERTICAL);
-        movieList.setPadding(0, dp(12), 0, dp(28));
-        scroll.addView(movieList, new ScrollView.LayoutParams(ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
-        root.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+        movieList.setPadding(0, dp(4), 0, dp(12));
+        scroll.addView(movieList, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.HORIZONTAL);
+        nav.setPadding(dp(6), dp(6), dp(6), dp(6));
+        Ui.card(nav, this, 22);
+        LinearLayout.LayoutParams navLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64));
+        navLp.setMargins(0, dp(4), 0, 0);
+        root.addView(nav, navLp);
+        addNav(nav, "⌂\nBiblioteca", "all");
+        addNav(nav, "▶\nContinuar", "continue");
+        addNav(nav, "★\nFavoritos", "favorites");
+        addNav(nav, "◷\nHistórico", "history");
 
         setContentView(root);
+        updateNav();
     }
 
-    private void showMenu(View anchor) {
-        PopupMenu popup = new PopupMenu(this, anchor);
-        popup.getMenu().add("Biblioteca");
-        popup.getMenu().add("Continuar assistindo");
-        popup.getMenu().add("Favoritos");
-        popup.getMenu().add("Importar ZIP");
-        popup.getMenu().add("Importar pasta");
-        popup.getMenu().add("Sobre");
-        popup.setOnMenuItemClickListener(item -> {
-            String t = item.getTitle().toString();
-            if (t.equals("Biblioteca")) setFilter("all");
-            else if (t.equals("Continuar assistindo")) setFilter("continue");
-            else if (t.equals("Favoritos")) setFilter("favorites");
-            else if (t.equals("Importar ZIP")) pickZip();
-            else if (t.equals("Importar pasta")) pickFolder();
-            else showAbout();
-            return true;
-        });
-        popup.show();
+    private TextView statCard(LinearLayout parent, String value, String label, String icon) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setPadding(dp(6), dp(7), dp(6), dp(7));
+        Ui.card(box, this, 18);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(72), 1);
+        lp.setMargins(dp(3), 0, dp(3), 0);
+        parent.addView(box, lp);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER);
+        TextView ic = text(icon, 14, true, Ui.PURPLE);
+        ic.setGravity(Gravity.CENTER);
+        row.addView(ic, new LinearLayout.LayoutParams(dp(22), dp(24)));
+        TextView number = text(value, 19, true, Ui.TEXT);
+        row.addView(number);
+        box.addView(row);
+        TextView l = text(label, 10, false, Ui.MUTED);
+        l.setGravity(Gravity.CENTER);
+        box.addView(l);
+        return number;
     }
 
-    private Button filterButton(String title, String value) {
-        Button b = new Button(this);
-        b.setText(title);
-        b.setAllCaps(false);
-        b.setTextSize(12);
+    private void addNav(LinearLayout nav, String label, String value) {
+        TextView b = text(label, 10, true, Ui.MUTED);
+        b.setGravity(Gravity.CENTER);
+        b.setTag(value);
+        b.setLines(2);
         b.setOnClickListener(v -> setFilter(value));
-        return b;
+        nav.addView(b, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
+        navButtons.add(b);
     }
 
-    private Button compactButton(String text) {
-        Button b = new Button(this);
-        b.setText(text);
-        b.setAllCaps(false);
-        b.setMinWidth(0);
-        b.setMinHeight(0);
-        b.setPadding(0, 0, 0, 0);
+    private void updateNav() {
+        for (TextView b : navButtons) {
+            boolean active = filter.equals(String.valueOf(b.getTag()));
+            b.setTextColor(active ? Color.WHITE : Ui.MUTED);
+            b.setBackground(active ? Ui.gradient(this, 16) : new ColorDrawable(Color.TRANSPARENT));
+        }
+    }
+
+    private void showSideMenu() {
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(18), statusBarHeight() + dp(14), dp(18), dp(18));
+        panel.setBackgroundColor(Color.WHITE);
+
+        LinearLayout brand = new LinearLayout(this);
+        brand.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.icone);
+        brand.addView(logo, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        LinearLayout words = new LinearLayout(this);
+        words.setOrientation(LinearLayout.VERTICAL);
+        words.setPadding(dp(12), 0, 0, 0);
+        words.addView(text("Cine Offline", 20, true, Ui.TEXT));
+        words.addView(text("100% local • sem internet", 11, false, Ui.MUTED));
+        brand.addView(words);
+        panel.addView(brand);
+
+        View line = new View(this);
+        line.setBackgroundColor(Ui.BORDER);
+        LinearLayout.LayoutParams lineLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        lineLp.setMargins(0, dp(18), 0, dp(12));
+        panel.addView(line, lineLp);
+
+        menuRow(panel, "⌂", "Biblioteca", "Todos os filmes importados", () -> { dialog.dismiss(); setFilter("all"); });
+        menuRow(panel, "▶", "Continuar assistindo", "Retome de onde parou", () -> { dialog.dismiss(); setFilter("continue"); });
+        menuRow(panel, "★", "Favoritos", "Sua seleção preferida", () -> { dialog.dismiss(); setFilter("favorites"); });
+        menuRow(panel, "◷", "Histórico", "Últimos filmes reproduzidos", () -> { dialog.dismiss(); setFilter("history"); });
+        menuRow(panel, "＋", "Importar filme", "ZIP ou pasta com index.m3u8", () -> { dialog.dismiss(); showImportChoice(); });
+        menuRow(panel, "ⓘ", "Sobre", "Informações do Cine Offline", () -> { dialog.dismiss(); showAbout(); });
+
+        TextView note = text("O Cine Offline não precisa de internet para reproduzir os filmes já importados.", 11, false, Ui.MUTED);
+        note.setPadding(dp(6), dp(18), dp(6), 0);
+        panel.addView(note);
+
+        dialog.setContentView(panel);
+        Window w = dialog.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            w.setDimAmount(0.45f);
+            w.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            w.setGravity(Gravity.START);
+        }
+        dialog.show();
+        if (w != null) w.setLayout((int) (getResources().getDisplayMetrics().widthPixels * 0.86f), ViewGroup.LayoutParams.MATCH_PARENT);
+    }
+
+    private void menuRow(LinearLayout panel, String icon, String title, String sub, Runnable action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(10), dp(10), dp(10), dp(10));
+        row.setBackground(Ui.rounded(Color.TRANSPARENT, 16, this));
+        row.setOnClickListener(v -> action.run());
+
+        TextView ic = text(icon, 21, true, Ui.PURPLE);
+        ic.setGravity(Gravity.CENTER);
+        ic.setBackground(Ui.softGradient(this, 14));
+        row.addView(ic, new LinearLayout.LayoutParams(dp(44), dp(44)));
+
+        LinearLayout words = new LinearLayout(this);
+        words.setOrientation(LinearLayout.VERTICAL);
+        words.setPadding(dp(12), 0, 0, 0);
+        words.addView(text(title, 14, true, Ui.TEXT));
+        words.addView(text(sub, 10, false, Ui.MUTED));
+        row.addView(words, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        panel.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
+    }
+
+    private TextView iconButton(String value) {
+        TextView b = text(value, 24, true, Color.WHITE);
+        b.setGravity(Gravity.CENTER);
+        b.setBackground(Ui.rounded(Color.argb(42, 255, 255, 255), 16, this));
         return b;
     }
 
     private void setFilter(String f) {
         filter = f;
         if (f.equals("continue")) {
-            pageTitle.setText("Continuar assistindo");
+            pageTitle.setText("Continuar");
             pageSubtitle.setText("Retome de onde parou");
         } else if (f.equals("favorites")) {
             pageTitle.setText("Favoritos");
             pageSubtitle.setText("Seus filmes preferidos");
+        } else if (f.equals("history")) {
+            pageTitle.setText("Histórico");
+            pageSubtitle.setText("O que você assistiu recentemente");
         } else {
             pageTitle.setText("Cine Offline");
             pageSubtitle.setText("Sua biblioteca local");
         }
+        updateNav();
         refresh();
     }
 
@@ -179,93 +339,231 @@ public class MainActivity extends Activity {
             if (isContinue(m)) cont++;
             if (m.favorite) fav++;
         }
-        stats.setText(all.size() + " filmes  •  " + cont + " continuar  •  " + fav + " favoritos");
+        statMovies.setText(String.valueOf(all.size()));
+        statContinue.setText(String.valueOf(cont));
+        statFavorites.setText(String.valueOf(fav));
 
+        String q = search == null ? "" : search.getText().toString().trim().toLowerCase(Locale.ROOT);
         List<Movie> visible = new ArrayList<>();
         for (Movie m : all) {
             if (filter.equals("favorites") && !m.favorite) continue;
             if (filter.equals("continue") && !isContinue(m)) continue;
+            if (filter.equals("history") && m.lastPlayedAt <= 0) continue;
+            if (!q.isEmpty() && !m.title.toLowerCase(Locale.ROOT).contains(q)) continue;
             visible.add(m);
+        }
+        if (filter.equals("history")) {
+            Collections.sort(visible, (a, b) -> Long.compare(b.lastPlayedAt, a.lastPlayedAt));
         }
 
         movieList.removeAllViews();
+        movieList.addView(sectionHeader(sectionTitle(), visible.size()));
         if (visible.isEmpty()) {
-            TextView empty = text(filter.equals("all") ? "Nenhum filme importado ainda.\nToque em + para adicionar um ZIP ou uma pasta." : "Nenhum filme nesta seção.", 16, false, Color.GRAY);
-            empty.setGravity(Gravity.CENTER);
-            empty.setPadding(dp(20), dp(60), dp(20), dp(60));
-            movieList.addView(empty);
+            movieList.addView(emptyState(q));
             return;
         }
         for (Movie m : visible) movieList.addView(movieCard(m));
     }
 
+    private String sectionTitle() {
+        if (filter.equals("continue")) return "Continuar assistindo";
+        if (filter.equals("favorites")) return "Seus favoritos";
+        if (filter.equals("history")) return "Assistidos recentemente";
+        return "Minha biblioteca";
+    }
+
+    private View sectionHeader(String title, int count) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(8), dp(4), dp(10));
+        row.addView(text(title, 17, true, Ui.TEXT), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        TextView c = text(count + (count == 1 ? " item" : " itens"), 11, true, Ui.PURPLE);
+        c.setGravity(Gravity.CENTER);
+        c.setBackground(Ui.softGradient(this, 12));
+        row.addView(c, new LinearLayout.LayoutParams(dp(72), dp(28)));
+        return row;
+    }
+
+    private View emptyState(String query) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(Gravity.CENTER_HORIZONTAL);
+        card.setPadding(dp(22), dp(28), dp(22), dp(26));
+        Ui.card(card, this, 24);
+
+        ImageView icon = new ImageView(this);
+        icon.setImageResource(R.drawable.icone);
+        card.addView(icon, new LinearLayout.LayoutParams(dp(78), dp(78)));
+
+        String title;
+        String sub;
+        if (!query.isEmpty()) {
+            title = "Nada encontrado";
+            sub = "Não encontrei nenhum filme com “" + query + "”.";
+        } else if (filter.equals("continue")) {
+            title = "Nada para continuar";
+            sub = "Quando você parar um filme no meio, ele aparece aqui automaticamente.";
+        } else if (filter.equals("favorites")) {
+            title = "Nenhum favorito ainda";
+            sub = "Toque na estrela de um filme para deixar ele fácil de encontrar.";
+        } else if (filter.equals("history")) {
+            title = "Histórico vazio";
+            sub = "Os filmes que você abrir vão aparecer aqui.";
+        } else {
+            title = "Sua biblioteca está vazia";
+            sub = "Importe um ZIP ou uma pasta com index.m3u8 + arquivos .dat/.ts. Depois, o filme fica disponível offline.";
+        }
+
+        TextView t = text(title, 19, true, Ui.TEXT);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(0, dp(14), 0, dp(5));
+        card.addView(t);
+        TextView s = text(sub, 13, false, Ui.MUTED);
+        s.setGravity(Gravity.CENTER);
+        card.addView(s);
+
+        if (filter.equals("all") && query.isEmpty()) {
+            TextView add = text("＋  Importar filme", 14, true, Color.WHITE);
+            Ui.button(add, this, true);
+            add.setOnClickListener(v -> showImportChoice());
+            LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
+            bp.setMargins(0, dp(18), 0, dp(14));
+            card.addView(add, bp);
+
+            LinearLayout features = new LinearLayout(this);
+            features.setGravity(Gravity.CENTER);
+            features.addView(featureChip("100% offline"));
+            features.addView(featureChip("Capa automática"));
+            features.addView(featureChip("Progresso salvo"));
+            card.addView(features);
+        }
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cp.setMargins(0, 0, 0, dp(14));
+        card.setLayoutParams(cp);
+        return card;
+    }
+
+    private TextView featureChip(String label) {
+        TextView c = text(label, 9, true, Ui.PURPLE);
+        c.setGravity(Gravity.CENTER);
+        c.setBackground(Ui.softGradient(this, 11));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(30), 1);
+        lp.setMargins(dp(2), 0, dp(2), 0);
+        c.setLayoutParams(lp);
+        return c;
+    }
+
     private View movieCard(Movie m) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(14), dp(14), dp(14));
-        card.setBackgroundColor(Color.WHITE);
-        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        cp.setMargins(0, 0, 0, dp(12));
+        card.setPadding(dp(10), dp(10), dp(10), dp(12));
+        Ui.card(card, this, 24);
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cp.setMargins(0, 0, 0, dp(14));
         card.setLayoutParams(cp);
 
-        LinearLayout info = new LinearLayout(this);
-        info.setGravity(Gravity.CENTER_VERTICAL);
+        FrameLayout poster = new FrameLayout(this);
+        poster.setClipToOutline(true);
+        poster.setBackground(Ui.softGradient(this, 20));
+        LinearLayout.LayoutParams pp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(182));
+        card.addView(poster, pp);
 
         ImageView cover = new ImageView(this);
         cover.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        cover.setBackgroundColor(Color.rgb(224, 228, 238));
         Bitmap bm = null;
         if (m.coverPath != null && !m.coverPath.isEmpty()) bm = BitmapFactory.decodeFile(m.coverPath);
-        if (bm != null) cover.setImageBitmap(bm);
-        else cover.setImageResource(android.R.drawable.ic_media_play);
-        info.addView(cover, new LinearLayout.LayoutParams(dp(84), dp(110)));
+        if (bm != null) {
+            cover.setImageBitmap(bm);
+        } else {
+            cover.setImageResource(R.drawable.icone);
+            cover.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+            cover.setPadding(dp(52), dp(52), dp(52), dp(52));
+        }
+        poster.addView(cover, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        poster.setOnClickListener(v -> openPlayer(m));
 
-        LinearLayout words = new LinearLayout(this);
-        words.setOrientation(LinearLayout.VERTICAL);
-        words.setPadding(dp(14), 0, 0, 0);
-        TextView title = text(m.title, 18, true, Color.rgb(32, 40, 58));
-        TextView meta = text(progressText(m), 13, false, Color.DKGRAY);
-        words.addView(title);
-        words.addView(meta);
-        info.addView(words, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        TextView offline = text("● OFFLINE", 9, true, Color.WHITE);
+        offline.setGravity(Gravity.CENTER);
+        offline.setBackground(Ui.rounded(Color.argb(205, 28, 35, 58), 11, this));
+        FrameLayout.LayoutParams offLp = new FrameLayout.LayoutParams(dp(76), dp(28), Gravity.TOP | Gravity.START);
+        offLp.setMargins(dp(10), dp(10), 0, 0);
+        poster.addView(offline, offLp);
+
+        TextView fav = text(m.favorite ? "★" : "☆", 23, true, Color.WHITE);
+        fav.setGravity(Gravity.CENTER);
+        fav.setBackground(Ui.rounded(Color.argb(190, 28, 35, 58), 16, this));
+        fav.setOnClickListener(v -> { m.favorite = !m.favorite; repo.save(m); refresh(); });
+        FrameLayout.LayoutParams favLp = new FrameLayout.LayoutParams(dp(42), dp(42), Gravity.TOP | Gravity.END);
+        favLp.setMargins(0, dp(9), dp(9), 0);
+        poster.addView(fav, favLp);
+
+        if (isContinue(m)) {
+            TextView resume = text("Continuar em " + time(m.progressMs), 10, true, Color.WHITE);
+            resume.setGravity(Gravity.CENTER);
+            resume.setBackground(Ui.rounded(Color.argb(215, 108, 99, 231), 11, this));
+            FrameLayout.LayoutParams rlp = new FrameLayout.LayoutParams(dp(126), dp(29), Gravity.BOTTOM | Gravity.START);
+            rlp.setMargins(dp(10), 0, 0, dp(10));
+            poster.addView(resume, rlp);
+        }
+
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.VERTICAL);
+        info.setPadding(dp(4), dp(11), dp(4), 0);
+        TextView title = text(m.title, 18, true, Ui.TEXT);
+        title.setMaxLines(2);
+        info.addView(title);
+
+        String meta = progressText(m);
+        if (filter.equals("history") && m.lastPlayedAt > 0) meta = "Última reprodução: " + relativeDate(m.lastPlayedAt) + "  •  " + meta;
+        TextView details = text(meta, 11, false, Ui.MUTED);
+        details.setPadding(0, dp(4), 0, dp(7));
+        info.addView(details);
+
+        if (m.durationMs > 0 && m.progressMs > 0) {
+            ProgressBar progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+            progress.setMax(1000);
+            progress.setProgress((int) Math.min(1000, (m.progressMs * 1000L) / Math.max(1, m.durationMs)));
+            progress.setProgressTintList(ColorStateList.valueOf(Ui.PURPLE));
+            progress.setProgressBackgroundTintList(ColorStateList.valueOf(Color.rgb(230, 232, 242)));
+            info.addView(progress, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(5)));
+        }
         card.addView(info);
 
         LinearLayout actions = new LinearLayout(this);
-        actions.setPadding(0, dp(10), 0, 0);
-        Button watch = new Button(this);
-        watch.setAllCaps(false);
-        watch.setText(isContinue(m) ? "▶ Continuar" : "▶ Assistir");
+        actions.setGravity(Gravity.CENTER_VERTICAL);
+        actions.setPadding(dp(4), dp(11), dp(4), 0);
+        TextView watch = text(isContinue(m) ? "▶  Continuar" : "▶  Assistir", 14, true, Color.WHITE);
+        Ui.button(watch, this, true);
         watch.setOnClickListener(v -> openPlayer(m));
         actions.addView(watch, new LinearLayout.LayoutParams(0, dp(48), 1));
 
-        Button fav = compactButton(m.favorite ? "★" : "☆");
-        fav.setTextSize(25);
-        fav.setOnClickListener(v -> { m.favorite = !m.favorite; repo.save(m); refresh(); });
-        actions.addView(fav, new LinearLayout.LayoutParams(dp(54), dp(48)));
-
-        Button more = compactButton("⋮");
-        more.setTextSize(24);
-        more.setOnClickListener(v -> showMovieMenu(v, m));
-        actions.addView(more, new LinearLayout.LayoutParams(dp(54), dp(48)));
+        TextView more = text("⋮", 25, true, Ui.TEXT);
+        Ui.button(more, this, false);
+        more.setOnClickListener(v -> showMovieMenu(m));
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(dp(52), dp(48));
+        mlp.setMargins(dp(8), 0, 0, 0);
+        actions.addView(more, mlp);
         card.addView(actions);
         return card;
     }
 
-    private void showMovieMenu(View anchor, Movie m) {
-        PopupMenu p = new PopupMenu(this, anchor);
-        p.getMenu().add("Renomear");
-        p.getMenu().add("Alterar capa");
-        p.getMenu().add("Zerar progresso");
-        p.getMenu().add("Excluir filme");
-        p.setOnMenuItemClickListener(item -> {
-            String t = item.getTitle().toString();
-            if (t.equals("Renomear")) renameMovie(m);
-            else if (t.equals("Alterar capa")) pickCover(m);
-            else if (t.equals("Zerar progresso")) { m.progressMs = 0; repo.save(m); refresh(); }
-            else confirmDelete(m);
-            return true;
-        });
-        p.show();
+    private void showMovieMenu(Movie m) {
+        String[] options = {
+                m.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos",
+                "Renomear",
+                "Alterar capa",
+                "Zerar progresso",
+                "Excluir filme"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle(m.title)
+                .setItems(options, (d, which) -> {
+                    if (which == 0) { m.favorite = !m.favorite; repo.save(m); refresh(); }
+                    else if (which == 1) renameMovie(m);
+                    else if (which == 2) pickCover(m);
+                    else if (which == 3) { m.progressMs = 0; repo.save(m); refresh(); }
+                    else confirmDelete(m);
+                }).show();
     }
 
     private void renameMovie(Movie m) {
@@ -273,9 +571,13 @@ public class MainActivity extends Activity {
         input.setSingleLine(true);
         input.setText(m.title);
         input.setSelectAllOnFocus(true);
+        int pad = dp(18);
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(pad, 0, pad, 0);
+        wrap.addView(input);
         new AlertDialog.Builder(this)
                 .setTitle("Renomear filme")
-                .setView(input)
+                .setView(wrap)
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Salvar", (d, w) -> {
                     String s = input.getText().toString().trim();
@@ -294,7 +596,7 @@ public class MainActivity extends Activity {
     private void confirmDelete(Movie m) {
         new AlertDialog.Builder(this)
                 .setTitle("Excluir filme?")
-                .setMessage("A cópia offline importada pelo Cine Offline será apagada.")
+                .setMessage("A cópia importada pelo Cine Offline será apagada do armazenamento interno do app.")
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Excluir", (d, w) -> { repo.delete(m); refresh(); })
                 .show();
@@ -309,7 +611,8 @@ public class MainActivity extends Activity {
     private void showImportChoice() {
         new AlertDialog.Builder(this)
                 .setTitle("Adicionar filme")
-                .setItems(new String[]{"Importar ZIP", "Importar pasta"}, (d, which) -> {
+                .setMessage("Escolha como o filme está salvo no celular.")
+                .setItems(new String[]{"📦 Importar ZIP", "📁 Importar pasta"}, (d, which) -> {
                     if (which == 0) pickZip(); else pickFolder();
                 }).show();
     }
@@ -338,7 +641,7 @@ public class MainActivity extends Activity {
             askTitleAndImport(uri, false, defaultName(uri));
         } else if (requestCode == REQ_FOLDER) {
             try {
-                int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
                 getContentResolver().takePersistableUriPermission(uri, flags);
             } catch (Exception ignored) {}
             askTitleAndImport(uri, true, "Filme offline");
@@ -364,24 +667,40 @@ public class MainActivity extends Activity {
         input.setSingleLine(true);
         input.setText(defaultTitle);
         input.setSelectAllOnFocus(true);
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(dp(18), 0, dp(18), 0);
+        wrap.addView(input);
         new AlertDialog.Builder(this)
                 .setTitle("Nome do filme")
-                .setView(input)
+                .setMessage("Você pode mudar esse nome depois.")
+                .setView(wrap)
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Importar", (d, w) -> startImport(uri, folder, input.getText().toString()))
                 .show();
     }
 
     private void startImport(Uri uri, boolean folder, String title) {
-        ProgressDialog progress = new ProgressDialog(this);
-        progress.setTitle("Importando filme");
-        progress.setMessage("Preparando…");
-        progress.setIndeterminate(true);
-        progress.setCancelable(false);
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(24), dp(22), dp(24), dp(16));
+        ProgressBar spinner = new ProgressBar(this);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
+        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView message = text("Preparando…", 13, false, Ui.MUTED);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, dp(14), 0, 0);
+        content.addView(message);
+
+        AlertDialog progress = new AlertDialog.Builder(this)
+                .setTitle("Importando filme")
+                .setView(content)
+                .setCancelable(false)
+                .create();
         progress.show();
 
         executor.execute(() -> {
-            MovieImporter.ProgressListener listener = text -> runOnUiThread(() -> progress.setMessage(text));
+            MovieImporter.ProgressListener listener = txt -> runOnUiThread(() -> message.setText(txt));
             ImportResult result = folder
                     ? MovieImporter.importFolder(getApplicationContext(), uri, title, listener)
                     : MovieImporter.importZip(getApplicationContext(), uri, title, listener);
@@ -390,7 +709,7 @@ public class MainActivity extends Activity {
                 if (result.ok) {
                     repo.save(result.movie);
                     setFilter("all");
-                    Toast.makeText(this, "Filme importado. Já pode assistir offline.", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "Filme importado. A capa foi criada e ele já pode ser assistido offline.", Toast.LENGTH_LONG).show();
                 } else {
                     new AlertDialog.Builder(this).setTitle("Não foi possível importar").setMessage(result.error).setPositiveButton("OK", null).show();
                 }
@@ -418,7 +737,7 @@ public class MainActivity extends Activity {
     private void showAbout() {
         new AlertDialog.Builder(this)
                 .setTitle("Cine Offline")
-                .setMessage("Player local para filmes HLS salvos como index.m3u8 + segmentos .dat/.ts.\n\nNão usa internet e não contorna DRM ou criptografia.")
+                .setMessage("Player local para filmes HLS salvos como index.m3u8 + segmentos .dat/.ts.\n\nRecursos: biblioteca, busca, favoritos, histórico, continuar de onde parou, capa automática, capa personalizada, velocidade, avanço/retorno de 10 s e tela cheia.\n\nA reprodução dos filmes importados não usa internet.")
                 .setPositiveButton("OK", null).show();
     }
 
@@ -427,10 +746,21 @@ public class MainActivity extends Activity {
     }
 
     private String progressText(Movie m) {
-        if (m.durationMs <= 0) return m.progressMs > 0 ? "Progresso salvo: " + time(m.progressMs) : "Pronto para assistir offline";
+        if (m.durationMs <= 0) return m.progressMs > 0 ? "Progresso salvo em " + time(m.progressMs) : "Pronto para assistir offline";
         int pct = (int) Math.min(100, Math.round((m.progressMs * 100.0) / m.durationMs));
         if (m.progressMs < 15_000) return "Duração: " + time(m.durationMs);
         return time(m.progressMs) + " / " + time(m.durationMs) + "  •  " + pct + "%";
+    }
+
+    private String relativeDate(long ts) {
+        long diff = Math.max(0, System.currentTimeMillis() - ts);
+        long min = diff / 60_000;
+        if (min < 1) return "agora";
+        if (min < 60) return "há " + min + " min";
+        long h = min / 60;
+        if (h < 24) return "há " + h + " h";
+        long d = h / 24;
+        return "há " + d + (d == 1 ? " dia" : " dias");
     }
 
     private String time(long ms) {
@@ -451,7 +781,17 @@ public class MainActivity extends Activity {
         return v;
     }
 
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
+    private int statusBarHeight() {
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : dp(24);
+    }
+
+    private int navigationBarHeight() {
+        int id = getResources().getIdentifier("navigation_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : 0;
+    }
+
+    private int dp(float value) {
+        return Ui.dp(this, value);
     }
 }

@@ -11,6 +11,8 @@ public class Movie {
     public long durationMs = 0;
     public long progressMs = 0;
     public long addedAt = 0;
+    public long lastPlayedAt = 0;
+    public int playCount = 0;
     public boolean favorite = false;
 
     public JSONObject toJson() {
@@ -24,6 +26,8 @@ public class Movie {
             o.put("durationMs", durationMs);
             o.put("progressMs", progressMs);
             o.put("addedAt", addedAt);
+            o.put("lastPlayedAt", lastPlayedAt);
+            o.put("playCount", playCount);
             o.put("favorite", favorite);
         } catch (Exception ignored) {}
         return o;
@@ -39,6 +43,8 @@ public class Movie {
         m.durationMs = o.optLong("durationMs", 0);
         m.progressMs = o.optLong("progressMs", 0);
         m.addedAt = o.optLong("addedAt", 0);
+        m.lastPlayedAt = o.optLong("lastPlayedAt", 0);
+        m.playCount = o.optInt("playCount", 0);
         m.favorite = o.optBoolean("favorite", false);
         return m;
     }

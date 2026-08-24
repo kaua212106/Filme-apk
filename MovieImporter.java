@@ -1,6 +1,8 @@
 package com.offlineplayer.cineoffline;
 
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 
 import androidx.documentfile.provider.DocumentFile;
@@ -12,7 +14,10 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -50,7 +55,7 @@ public class MovieImporter {
                             copyEntry(zis, out);
                             segments.put(n, out);
                             copied++;
-                            if (copied % 8 == 0) listener.onProgress("Copiando segmentos… " + copied);
+                            if (copied % 8 == 0) listener.onProgress("Copiando vídeo… " + copied + " partes");
                         }
                     } else if (isImage(lower) && !new File(dir, "cover.jpg").exists()) {
                         copyEntry(zis, new File(dir, "cover.jpg"));
@@ -93,7 +98,7 @@ public class MovieImporter {
         }
         if (playlist.contains("#EXT-X-KEY") && !playlist.contains("METHOD=NONE")) {
             deleteRecursive(dir);
-            return ImportResult.fail("Esta playlist usa criptografia HLS. O app não remove DRM nem chaves de proteção.");
+            return ImportResult.fail("Esta playlist usa criptografia HLS. O Cine Offline não remove DRM nem chaves de proteção.");
         }
         if (segments.isEmpty()) {
             deleteRecursive(dir);
@@ -104,7 +109,7 @@ public class MovieImporter {
         RewriteResult rr = rewritePlaylist(playlist, segments);
         if (rr.missing > 0) {
             deleteRecursive(dir);
-            return ImportResult.fail("Faltam " + rr.missing + " segmentos exigidos pelo index.m3u8.");
+            return ImportResult.fail("Faltam " + rr.missing + " partes exigidas pelo index.m3u8.");
         }
 
         File offline = new File(dir, "offline.m3u8");
@@ -115,17 +120,52 @@ public class MovieImporter {
             return ImportResult.fail("Não consegui criar a playlist offline: " + safeMessage(e));
         }
 
+        File cover = new File(dir, "cover.jpg");
+        if (!cover.exists()) {
+            listener.onProgress("Criando capa automaticamente…");
+            createAutomaticCover(segments, cover);
+        }
+
         Movie movie = new Movie();
         movie.id = id;
         movie.title = title == null || title.trim().isEmpty() ? "Filme offline" : title.trim();
         movie.folderPath = dir.getAbsolutePath();
         movie.playlistPath = offline.getAbsolutePath();
-        File cover = new File(dir, "cover.jpg");
         movie.coverPath = cover.exists() ? cover.getAbsolutePath() : "";
         movie.durationMs = rr.durationMs;
         movie.progressMs = 0;
         movie.addedAt = System.currentTimeMillis();
+        movie.lastPlayedAt = 0;
+        movie.playCount = 0;
         return ImportResult.ok(movie);
+    }
+
+    private static void createAutomaticCover(Map<Integer, File> segments, File cover) {
+        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+        try {
+            List<Integer> keys = new ArrayList<>(segments.keySet());
+            Collections.sort(keys);
+            int attempts = Math.min(keys.size(), 4);
+            Bitmap frame = null;
+            for (int i = 0; i < attempts && frame == null; i++) {
+                File segment = segments.get(keys.get(i));
+                if (segment == null || !segment.exists()) continue;
+                try {
+                    retriever.setDataSource(segment.getAbsolutePath());
+                    frame = retriever.getFrameAtTime(1_000_000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+                    if (frame == null) frame = retriever.getFrameAtTime();
+                } catch (Exception ignored) {}
+            }
+            if (frame != null) {
+                try (FileOutputStream fos = new FileOutputStream(cover)) {
+                    frame.compress(Bitmap.CompressFormat.JPEG, 88, fos);
+                }
+                frame.recycle();
+            }
+        } catch (Exception ignored) {
+        } finally {
+            try { retriever.release(); } catch (Exception ignored) {}
+        }
     }
 
     private static void scanFolder(Context context, DocumentFile folder, File dir, Holder h,
@@ -154,7 +194,7 @@ public class MovieImporter {
                         copy(in, fos);
                     }
                     h.segments.put(n, out);
-                    if (h.segments.size() % 8 == 0) listener.onProgress("Copiando segmentos… " + h.segments.size());
+                    if (h.segments.size() % 8 == 0) listener.onProgress("Copiando vídeo… " + h.segments.size() + " partes");
                 }
             } else if (isImage(lower) && !new File(dir, "cover.jpg").exists()) {
                 try (InputStream in = context.getContentResolver().openInputStream(item.getUri());

@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Sem permissão INTERNET: reprodução somente local/offline. -->
+    <!-- Sem permissão INTERNET: os filmes importados são reproduzidos localmente. -->
     <application
         android:allowBackup="true"
+        android:icon="@drawable/icone"
+        android:roundIcon="@drawable/icone"
         android:label="Cine Offline"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">

@@ -1,30 +1,37 @@
-# Cine Offline — versão com arquivos soltos
+# Cine Offline 2.0
 
-Esta edição foi reorganizada para que TODOS os arquivos deste ZIP fiquem na raiz do repositório, sem `app/`, `src/`, `res/` ou qualquer outra pasta de código.
+Versão visual refeita para combinar com o estilo dos outros apps: gradiente roxo/azul, cartões arredondados, menu lateral, busca, barra inferior e capa automática.
 
-Arquivos principais:
-- `MainActivity.java` — biblioteca, importação e gerenciamento.
-- `PlayerActivity.java` — player offline Media3/ExoPlayer.
-- `MovieImporter.java` — lê ZIP/pasta, converte a referência `0000.ts` para o segmento `000000.dat` e cria a playlist local.
-- `AndroidManifest.xml` — configuração Android.
-- `build.gradle`, `settings.gradle`, `gradle.properties` — compilação.
-- `build-apk.yml` — conteúdo pronto do workflow do GitHub Actions.
+## Arquivos na raiz
+- AndroidManifest.xml
+- MainActivity.java
+- PlayerActivity.java
+- Movie.java
+- MovieRepository.java
+- MovieImporter.java
+- ImportResult.java
+- Ui.java
+- build.gradle
+- settings.gradle
+- gradle.properties
+- icone.png
 
-## Como subir no GitHub
-Faça upload de todos os arquivos soltos na raiz do repositório.
+O workflow `build-apk.yml` continua igual e deve ficar em `.github/workflows/build-apk.yml`.
 
-## Como gerar o APK sem enviar pastas
-O GitHub só reconhece workflows se o arquivo estiver em `.github/workflows/`. Você não precisa enviar essa pasta manualmente:
-
-1. No repositório, abra **Actions**.
-2. Escolha **set up a workflow yourself** / criar um workflow.
-3. Apague o conteúdo sugerido.
-4. Copie e cole o conteúdo de `build-apk.yml`.
-5. Salve/Commit.
-6. Abra **Actions > Build Cine Offline APK > Run workflow**.
-7. Quando terminar, baixe o artefato **CineOffline-APK**.
-
-O GitHub cria `.github/workflows/` automaticamente ao salvar o workflow.
-
-## Reprodução
-O app foi feito para playlists locais HLS `index.m3u8` com segmentos `.dat` ou `.ts` sem DRM. Ele não usa permissão de internet e não remove criptografia/DRM.
+## Recursos
+- Importação por ZIP ou pasta
+- index.m3u8 + .dat/.ts
+- Reprodução 100% local depois da importação
+- Capa automática extraída do próprio vídeo
+- Capa personalizada
+- Busca
+- Favoritos
+- Histórico
+- Continuar de onde parou
+- Progresso visual
+- Velocidades de 0,5x a 2x
+- Voltar/avançar 10 segundos
+- Reiniciar vídeo
+- Tela cheia
+- Rotação
+- Renomear e excluir filmes

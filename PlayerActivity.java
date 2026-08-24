@@ -2,6 +2,8 @@ package com.offlineplayer.cineoffline;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
@@ -9,7 +11,6 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -17,26 +18,30 @@ import android.widget.Toast;
 import androidx.annotation.Nullable;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
-import androidx.media3.common.Player;
 import androidx.media3.common.PlaybackParameters;
+import androidx.media3.common.Player;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.ui.PlayerView;
 
 import java.io.File;
-import java.util.Locale;
 
 public class PlayerActivity extends Activity {
     private ExoPlayer player;
     private MovieRepository repo;
     private Movie movie;
     private PlayerView playerView;
-    private TextView title;
+    private LinearLayout topBar;
+    private LinearLayout bottomBar;
+    private TextView speedButton;
     private boolean started;
+    private boolean fullscreen;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        getWindow().setStatusBarColor(Color.BLACK);
+        getWindow().setNavigationBarColor(Color.BLACK);
         repo = new MovieRepository(this);
         String id = getIntent().getStringExtra("movieId");
         movie = repo.getById(id == null ? "" : id);
@@ -45,6 +50,11 @@ public class PlayerActivity extends Activity {
             finish();
             return;
         }
+
+        movie.lastPlayedAt = System.currentTimeMillis();
+        movie.playCount = movie.playCount + 1;
+        repo.save(movie);
+
         buildUi();
         initPlayer();
     }
@@ -53,74 +63,106 @@ public class PlayerActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.BLACK);
+        root.setPadding(0, statusBarHeight(), 0, 0);
 
-        LinearLayout top = new LinearLayout(this);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setPadding(dp(8), dp(6), dp(8), dp(6));
+        topBar = new LinearLayout(this);
+        topBar.setGravity(Gravity.CENTER_VERTICAL);
+        topBar.setPadding(dp(8), dp(6), dp(8), dp(6));
+        topBar.setBackgroundColor(Ui.NAVY);
 
-        Button back = new Button(this);
-        back.setText("‹");
-        back.setTextSize(28);
-        back.setTextColor(Color.WHITE);
-        back.setBackgroundColor(Color.TRANSPARENT);
+        TextView back = control("‹", 28);
         back.setOnClickListener(v -> finish());
-        top.addView(back, new LinearLayout.LayoutParams(dp(54), dp(50)));
+        topBar.addView(back, new LinearLayout.LayoutParams(dp(52), dp(48)));
 
-        title = new TextView(this);
-        title.setText(movie.title);
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(18);
-        title.setMaxLines(1);
-        top.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        LinearLayout titles = new LinearLayout(this);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        titles.setPadding(dp(8), 0, dp(8), 0);
+        TextView title = text(movie.title, 17, true, Color.WHITE);
+        title.setSingleLine(true);
+        titles.addView(title);
+        TextView local = text("● Reprodução local", 10, false, Color.rgb(168, 231, 208));
+        titles.addView(local);
+        topBar.addView(titles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
-        Button speed = new Button(this);
-        speed.setText("1×");
-        speed.setTextColor(Color.WHITE);
-        speed.setBackgroundColor(Color.TRANSPARENT);
-        speed.setOnClickListener(v -> chooseSpeed(speed));
-        top.addView(speed, new LinearLayout.LayoutParams(dp(70), dp(50)));
-        root.addView(top);
+        speedButton = control("1×", 14);
+        speedButton.setOnClickListener(v -> chooseSpeed());
+        topBar.addView(speedButton, new LinearLayout.LayoutParams(dp(56), dp(44)));
+
+        TextView rotate = control("↻", 23);
+        rotate.setOnClickListener(v -> rotateScreen());
+        topBar.addView(rotate, new LinearLayout.LayoutParams(dp(50), dp(44)));
+        root.addView(topBar);
 
         playerView = new PlayerView(this);
         playerView.setUseController(true);
         playerView.setControllerAutoShow(true);
+        playerView.setControllerShowTimeoutMs(3500);
+        playerView.setControllerHideOnTouch(true);
+        playerView.setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING);
         playerView.setKeepContentOnPlayerReset(true);
+        playerView.setBackgroundColor(Color.BLACK);
         root.addView(playerView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
-        LinearLayout bottom = new LinearLayout(this);
-        bottom.setGravity(Gravity.CENTER);
-        bottom.setPadding(dp(8), dp(6), dp(8), dp(8));
+        bottomBar = new LinearLayout(this);
+        bottomBar.setGravity(Gravity.CENTER);
+        bottomBar.setPadding(dp(8), dp(8), dp(8), Math.max(dp(10), navigationBarHeight()));
+        bottomBar.setBackgroundColor(Ui.NAVY);
 
-        Button rewind = new Button(this);
-        rewind.setText("↶ 10s");
-        rewind.setAllCaps(false);
+        TextView rewind = pill("↶ 10 s");
         rewind.setOnClickListener(v -> seekBy(-10_000));
-        bottom.addView(rewind, new LinearLayout.LayoutParams(0, dp(52), 1));
+        bottomBar.addView(rewind, weighted());
 
-        Button fullscreen = new Button(this);
-        fullscreen.setText("Tela cheia");
-        fullscreen.setAllCaps(false);
-        fullscreen.setOnClickListener(v -> toggleFullscreen());
-        bottom.addView(fullscreen, new LinearLayout.LayoutParams(0, dp(52), 1));
+        TextView restart = pill("↺ Início");
+        restart.setOnClickListener(v -> { if (player != null) player.seekTo(0); });
+        bottomBar.addView(restart, weighted());
 
-        Button forward = new Button(this);
-        forward.setText("10s ↷");
-        forward.setAllCaps(false);
+        TextView full = pill("⛶ Tela cheia");
+        full.setOnClickListener(v -> toggleFullscreen());
+        bottomBar.addView(full, weighted());
+
+        TextView forward = pill("10 s ↷");
         forward.setOnClickListener(v -> seekBy(10_000));
-        bottom.addView(forward, new LinearLayout.LayoutParams(0, dp(52), 1));
-        root.addView(bottom);
+        bottomBar.addView(forward, weighted());
+        root.addView(bottomBar);
 
         setContentView(root);
+    }
+
+    private LinearLayout.LayoutParams weighted() {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(48), 1);
+        p.setMargins(dp(3), 0, dp(3), 0);
+        return p;
+    }
+
+    private TextView control(String label, float size) {
+        TextView v = text(label, size, true, Color.WHITE);
+        v.setGravity(Gravity.CENTER);
+        v.setBackground(Ui.rounded(Color.argb(40, 255, 255, 255), 14, this));
+        return v;
+    }
+
+    private TextView pill(String label) {
+        TextView v = text(label, 11, true, Color.WHITE);
+        v.setGravity(Gravity.CENTER);
+        v.setBackground(Ui.rounded(Color.argb(34, 255, 255, 255), 13, this));
+        return v;
     }
 
     private void initPlayer() {
         File playlist = new File(movie.playlistPath);
         if (!playlist.exists()) {
-            new AlertDialog.Builder(this).setTitle("Arquivo ausente").setMessage("A playlist offline deste filme não foi encontrada.").setPositiveButton("OK", (d, w) -> finish()).show();
+            new AlertDialog.Builder(this)
+                    .setTitle("Arquivo ausente")
+                    .setMessage("A playlist offline deste filme não foi encontrada.")
+                    .setPositiveButton("OK", (d, w) -> finish())
+                    .show();
             return;
         }
 
-        player = new ExoPlayer.Builder(this).build();
+        player = new ExoPlayer.Builder(this)
+                .setSeekBackIncrementMs(10_000)
+                .setSeekForwardIncrementMs(10_000)
+                .build();
         playerView.setPlayer(player);
         player.setMediaItem(MediaItem.fromUri(Uri.fromFile(playlist)));
         player.addListener(new Player.Listener() {
@@ -155,28 +197,44 @@ public class PlayerActivity extends Activity {
         player.seekTo(target);
     }
 
-    private void chooseSpeed(Button button) {
+    private void chooseSpeed() {
         if (player == null) return;
-        String[] labels = {"0,5×", "0,75×", "1×", "1,25×", "1,5×", "2×"};
-        float[] values = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f};
+        String[] labels = {"0,5×", "0,75×", "1×", "1,25×", "1,5×", "1,75×", "2×"};
+        float[] values = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f};
         new AlertDialog.Builder(this)
-                .setTitle("Velocidade")
+                .setTitle("Velocidade de reprodução")
                 .setItems(labels, (d, which) -> {
                     player.setPlaybackParameters(new PlaybackParameters(values[which]));
-                    button.setText(labels[which]);
+                    speedButton.setText(labels[which]);
                 }).show();
     }
 
-    private void toggleFullscreen() {
-        int flags = getWindow().getDecorView().getSystemUiVisibility();
-        boolean full = (flags & View.SYSTEM_UI_FLAG_FULLSCREEN) != 0;
-        if (full) {
-            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+    private void rotateScreen() {
+        int o = getResources().getConfiguration().orientation;
+        if (o == Configuration.ORIENTATION_LANDSCAPE) {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         } else {
-            getWindow().getDecorView().setSystemUiVisibility(
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        }
+    }
+
+    private void toggleFullscreen() {
+        fullscreen = !fullscreen;
+        View decor = getWindow().getDecorView();
+        if (fullscreen) {
+            topBar.setVisibility(View.GONE);
+            bottomBar.setVisibility(View.GONE);
+            decor.setSystemUiVisibility(
                     View.SYSTEM_UI_FLAG_FULLSCREEN |
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        } else {
+            topBar.setVisibility(View.VISIBLE);
+            bottomBar.setVisibility(View.VISIBLE);
+            decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
         }
     }
 
@@ -187,6 +245,7 @@ public class PlayerActivity extends Activity {
         if (dur > 0) movie.durationMs = dur;
         if (dur > 0 && pos >= dur - 20_000) movie.progressMs = 0;
         else movie.progressMs = pos;
+        movie.lastPlayedAt = System.currentTimeMillis();
         repo.save(movie);
     }
 
@@ -207,7 +266,35 @@ public class PlayerActivity extends Activity {
         super.onDestroy();
     }
 
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
+    @Override
+    public void onBackPressed() {
+        if (fullscreen) {
+            toggleFullscreen();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    private TextView text(String value, float size, boolean bold, int color) {
+        TextView v = new TextView(this);
+        v.setText(value);
+        v.setTextSize(size);
+        v.setTextColor(color);
+        if (bold) v.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        return v;
+    }
+
+    private int statusBarHeight() {
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : dp(24);
+    }
+
+    private int navigationBarHeight() {
+        int id = getResources().getIdentifier("navigation_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : 0;
+    }
+
+    private int dp(float value) {
+        return Ui.dp(this, value);
     }
 }
