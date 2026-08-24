@@ -35,3 +35,8 @@ O workflow `build-apk.yml` continua igual e deve ficar em `.github/workflows/bui
 - Tela cheia
 - Rotação
 - Renomear e excluir filmes
+
+
+### Correções 3.1
+- Janela de importação refeita com botões visíveis em qualquer tema Android.
+- Contadores da tela inicial reduzidos e unidos em uma barra compacta.

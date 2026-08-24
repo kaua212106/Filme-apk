@@ -232,12 +232,15 @@ public class MainActivity extends Activity {
         heroSub.setPadding(0, dp(4), 0, dp(16));
         pageContent.addView(heroSub);
 
+        // Contadores compactos: uma única barra, sem ocupar metade da tela.
         LinearLayout stats = new LinearLayout(this);
         stats.setGravity(Gravity.CENTER);
+        stats.setPadding(dp(6), dp(4), dp(6), dp(4));
+        Ui.card(stats, this, 18);
         statMovies = homeStat(stats, String.valueOf(all.size()), "FILMES");
         statContinue = homeStat(stats, String.valueOf(continuing.size()), "CONTINUAR");
         statFavorites = homeStat(stats, String.valueOf(favorites.size()), "FAVORITOS");
-        LinearLayout.LayoutParams statsLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(112));
+        LinearLayout.LayoutParams statsLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
         statsLp.setMargins(0, 0, 0, dp(14));
         pageContent.addView(stats, statsLp);
 
@@ -264,21 +267,29 @@ public class MainActivity extends Activity {
     }
 
     private TextView homeStat(LinearLayout parent, String number, String label) {
+        if (parent.getChildCount() > 0) {
+            View divider = new View(this);
+            divider.setBackgroundColor(Ui.BORDER);
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(1), dp(38));
+            dlp.gravity = Gravity.CENTER_VERTICAL;
+            parent.addView(divider, dlp);
+        }
+
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setGravity(Gravity.CENTER);
-        Ui.card(box, this, 20);
-        TextView n = text(number, 27, false, Ui.BLUE);
+        box.setPadding(dp(4), dp(3), dp(4), dp(3));
+
+        TextView n = text(number, 20, true, Ui.BLUE);
         n.setGravity(Gravity.CENTER);
-        TextView l = text(label, 9, true, Ui.MUTED);
+        TextView l = text(label, 8, true, Ui.MUTED);
         l.setGravity(Gravity.CENTER);
         box.addView(n);
         LinearLayout.LayoutParams lpLabel = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lpLabel.setMargins(0, dp(8), 0, 0);
+        lpLabel.setMargins(0, dp(2), 0, 0);
         box.addView(l, lpLabel);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1);
-        lp.setMargins(dp(3), 0, dp(3), 0);
-        parent.addView(box, lp);
+
+        parent.addView(box, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
         return n;
     }
 
@@ -775,12 +786,84 @@ public class MainActivity extends Activity {
     }
 
     private void showImportChoice() {
-        new AlertDialog.Builder(this)
-                .setTitle("Adicionar filme")
-                .setMessage("Escolha como o filme está salvo no celular.")
-                .setItems(new String[]{"📦 Importar ZIP", "📁 Importar pasta"}, (d, which) -> {
-                    if (which == 0) pickZip(); else pickFolder();
-                }).show();
+        // Dialog próprio: em alguns aparelhos o AlertDialog.setItems deixava as opções invisíveis.
+        final Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(20), dp(20), dp(20), dp(16));
+        card.setBackground(Ui.rounded(Color.WHITE, 24, this));
+
+        TextView title = text("Adicionar filme", 20, true, Ui.TEXT);
+        card.addView(title);
+
+        TextView subtitle = text("Escolha de onde o Cine Offline deve importar o filme.", 12, false, Ui.MUTED);
+        subtitle.setPadding(0, dp(5), 0, dp(16));
+        card.addView(subtitle);
+
+        View zip = importChoiceRow("📦", "Importar ZIP", "Selecione um ZIP com index.m3u8 e os arquivos .dat/.ts", () -> {
+            dialog.dismiss();
+            pickZip();
+        });
+        card.addView(zip, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72)));
+
+        View folder = importChoiceRow("📁", "Importar pasta", "Selecione diretamente a pasta onde o filme está salvo", () -> {
+            dialog.dismiss();
+            pickFolder();
+        });
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
+        flp.setMargins(0, dp(10), 0, 0);
+        card.addView(folder, flp);
+
+        TextView cancel = text("Cancelar", 12, true, Ui.MUTED);
+        cancel.setGravity(Gravity.CENTER);
+        cancel.setOnClickListener(v -> dialog.dismiss());
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        clp.setMargins(0, dp(8), 0, 0);
+        card.addView(cancel, clp);
+
+        dialog.setContentView(card);
+        dialog.setCanceledOnTouchOutside(true);
+        dialog.show();
+
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            WindowManager.LayoutParams params = window.getAttributes();
+            params.width = getResources().getDisplayMetrics().widthPixels - dp(36);
+            params.height = WindowManager.LayoutParams.WRAP_CONTENT;
+            params.gravity = Gravity.CENTER;
+            window.setAttributes(params);
+        }
+    }
+
+    private View importChoiceRow(String icon, String title, String subtitle, Runnable action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14), dp(8), dp(14), dp(8));
+        row.setBackground(Ui.roundedStroke(Color.rgb(249, 249, 253), Ui.BORDER, 17, 1, this));
+        row.setOnClickListener(v -> action.run());
+
+        TextView ico = text(icon, 24, false, Ui.TEXT);
+        ico.setGravity(Gravity.CENTER);
+        row.addView(ico, new LinearLayout.LayoutParams(dp(46), ViewGroup.LayoutParams.MATCH_PARENT));
+
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.setGravity(Gravity.CENTER_VERTICAL);
+        TextView t = text(title, 15, true, Ui.TEXT);
+        TextView s = text(subtitle, 10, false, Ui.MUTED);
+        s.setMaxLines(2);
+        s.setPadding(0, dp(3), 0, 0);
+        texts.addView(t);
+        texts.addView(s);
+        row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+
+        TextView arrow = text("›", 25, false, Ui.PURPLE);
+        arrow.setGravity(Gravity.CENTER);
+        row.addView(arrow, new LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.MATCH_PARENT));
+        return row;
     }
 
     private void pickZip() {
