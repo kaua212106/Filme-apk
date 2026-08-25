@@ -805,13 +805,151 @@ public class MainActivity extends Activity {
                     msg.append("\n\n✅ Todos os itens da biblioteca foram associados. Agora você pode apagar esses downloads do app original. Para se proteger caso desinstale o Cine Offline, use também ‘Exportar backup da organização’. ");
                 }
 
-                new AlertDialog.Builder(this)
+                if (result.warning != null && !result.warning.trim().isEmpty()) {
+                    msg.append("\n\n").append(result.warning.trim());
+                }
+
+                AlertDialog.Builder done = new AlertDialog.Builder(this)
                         .setTitle("Nomes salvos")
                         .setMessage(msg.toString())
-                        .setPositiveButton("OK", null)
-                        .show();
+                        .setPositiveButton("OK", null);
+
+                if (result.notMatched > 0
+                        && !OriginalAppBridge.getPendingLocalItems(this).isEmpty()
+                        && !OriginalAppBridge.getPendingCapturedItems(this).isEmpty()) {
+                    done.setNegativeButton("Resolver pendentes", (d, w) -> showPendingOriginalResolver());
+                }
+                done.show();
             });
         });
+    }
+
+
+    private void showPendingOriginalResolver() {
+        List<OriginalAppBridge.PendingLocalItem> locals =
+                new ArrayList<>(OriginalAppBridge.getPendingLocalItems(this));
+        List<OriginalAppBridge.PendingCapturedItem> captured =
+                new ArrayList<>(OriginalAppBridge.getPendingCapturedItems(this));
+
+        if (locals.isEmpty()) {
+            Toast.makeText(this, "Não há itens pendentes.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (captured.isEmpty()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Sem nomes pendentes")
+                    .setMessage("Existem arquivos sem associação, mas a captura não deixou nomes individuais restantes para escolher.")
+                    .setPositiveButton("OK", null)
+                    .show();
+            return;
+        }
+
+        resolvePendingOriginalAt(locals, captured, 0);
+    }
+
+    private void resolvePendingOriginalAt(List<OriginalAppBridge.PendingLocalItem> locals,
+                                          List<OriginalAppBridge.PendingCapturedItem> captured,
+                                          int index) {
+        if (index >= locals.size() || captured.isEmpty()) {
+            OriginalAppBridge.clearPendingResolution(this);
+            renderPage();
+
+            OriginalAppBridge.IdentificationResult check =
+                    OriginalAppBridge.applySavedMappings(this, repo);
+            int remain = check.ok ? check.notMatched : 0;
+
+            new AlertDialog.Builder(this)
+                    .setTitle(remain == 0 ? "Tudo associado" : "Pendentes atualizados")
+                    .setMessage(remain == 0
+                            ? "✅ Todos os vídeos agora têm uma associação salva. Você pode exportar o backup e depois apagar os downloads do app original."
+                            : "Ainda restam " + remain + " item(ns) sem associação.")
+                    .setPositiveButton("OK", null)
+                    .show();
+            return;
+        }
+
+        OriginalAppBridge.PendingLocalItem local = locals.get(index);
+        String[] labels = new String[captured.size()];
+        for (int i = 0; i < captured.size(); i++) {
+            OriginalAppBridge.PendingCapturedItem item = captured.get(i);
+            String size = item.sizeText == null || item.sizeText.trim().isEmpty()
+                    ? pendingSize(item.sizeBytes)
+                    : item.sizeText;
+            labels[i] = item.title + (size.isEmpty() ? "" : "  •  " + size);
+        }
+
+        int suggested = closestPendingCaptured(local, captured);
+        int[] selected = new int[]{suggested};
+
+        String current = local.currentTitle == null || local.currentTitle.trim().isEmpty()
+                ? "Item sem nome"
+                : local.currentTitle.trim();
+        StringBuilder detail = new StringBuilder();
+        detail.append(current);
+        if (local.durationMs > 0) detail.append("  •  ").append(durationShort(local.durationMs));
+        if (local.sizeBytes > 0) detail.append("\\nTamanho local: ").append(pendingSize(local.sizeBytes));
+        if (local.resource != null && local.resource.length() >= 8) {
+            detail.append("\\nCódigo: …").append(local.resource.substring(local.resource.length() - 8));
+        }
+        detail.append("\\n\\nEscolha qual dos nomes capturados pertence a este arquivo. "
+                + "O mais próximo pelo tamanho já vem marcado como sugestão.");
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Resolver pendente " + (index + 1) + " de " + locals.size())
+                .setMessage(detail.toString())
+                .setSingleChoiceItems(labels, suggested, (d, which) -> selected[0] = which)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Salvar e continuar", null)
+                .create();
+
+        dialog.setOnShowListener(x -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                int which = selected[0];
+                if (which < 0 || which >= captured.size()) {
+                    Toast.makeText(this, "Escolha um nome.", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+
+                OriginalAppBridge.PendingCapturedItem picked = captured.get(which);
+                boolean ok = OriginalAppBridge.saveManualPendingMapping(
+                        this, repo, local.resource, picked);
+                if (!ok) {
+                    Toast.makeText(this, "Não consegui salvar essa associação.", Toast.LENGTH_LONG).show();
+                    return;
+                }
+
+                dialog.dismiss();
+                captured.remove(which);
+                renderPage();
+                resolvePendingOriginalAt(locals, captured, index + 1);
+            });
+        });
+        dialog.show();
+    }
+
+    private int closestPendingCaptured(OriginalAppBridge.PendingLocalItem local,
+                                       List<OriginalAppBridge.PendingCapturedItem> captured) {
+        if (captured == null || captured.isEmpty()) return -1;
+        if (local == null || local.sizeBytes <= 0) return 0;
+        int best = 0;
+        long bestDiff = Long.MAX_VALUE;
+        for (int i = 0; i < captured.size(); i++) {
+            long size = captured.get(i).sizeBytes;
+            if (size <= 0) continue;
+            long diff = Math.abs(local.sizeBytes - size);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private String pendingSize(long bytes) {
+        if (bytes <= 0) return "";
+        double mb = bytes / 1_000_000d;
+        if (mb >= 1000d) return String.format(Locale.getDefault(), "%.2f GB", mb / 1000d);
+        return String.format(Locale.getDefault(), "%.2f MB", mb);
     }
 
     private void applySavedOriginalNames() {

@@ -49,6 +49,8 @@ public final class OriginalAppBridge {
     private static final String PREF = "cine_original_bridge";
     private static final String KEY_PORT = "last_port";
     private static final String KEY_SAVED_MAP = "saved_resource_title_map";
+    private static final String KEY_PENDING_LOCALS = "pending_local_items";
+    private static final String KEY_PENDING_CAPTURED = "pending_captured_items";
     private static final Pattern RESOURCE_PATTERN = Pattern.compile("(?i)(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])");
 
     private OriginalAppBridge() {}
@@ -354,6 +356,19 @@ public final class OriginalAppBridge {
                     usedResources, usedCaptured);
         }
 
+        // 4) Quando sobram poucos itens, resolve o conjunto inteiro de uma vez.
+        // O algoritmo anterior analisava cada nome isoladamente e rejeitava casos em que
+        // dois vídeos tinham tamanhos muito próximos. Aqui comparamos TODAS as combinações
+        // restantes e escolhemos a combinação global de menor erro, mas só aceitamos se
+        // houver uma vantagem clara sobre a segunda melhor combinação.
+        int finalResolved = matchSmallRemainingSetGlobally(context, captured, locals, byResource,
+                usedResources, usedCaptured);
+        matched += finalResolved;
+
+        // Se ainda houver itens ambíguos, salva a lista para permitir resolver manualmente
+        // sem repetir toda a captura. Isso é especialmente útil quando só restam 1 ou 2.
+        savePendingResolution(context, captured, locals, usedResources, usedCaptured);
+
         if (byResource.isEmpty()) {
             return IdentificationResult.fail(
                     "Consegui ler " + captured.size() + " item(ns) na tela, mas não consegui ligar nenhum deles às pastas locais com segurança. "
@@ -362,9 +377,12 @@ public final class OriginalAppBridge {
 
         saveMappings(context, byResource);
         listener.onProgress("💾 Salvando filmes e episódios reconhecidos…");
+        String warning = finalResolved > 0
+                ? ("Resolvi " + finalResolved + " item(ns) restante(s) comparando o conjunto inteiro pelos tamanhos reais. "
+                + "Se ainda restar algum item, use “Resolver pendentes” em vez de repetir a captura.")
+                : "A associação usa o código exato do download quando o app original o disponibiliza e confere os tamanhos reais dos arquivos nos casos pendentes. As associações ficam no backup.";
         IdentificationResult result = applyMappingsToLibrary(context, repo, byResource,
-                captured.size(), byResource.size(),
-                "A associação usa o código exato do download quando o app original o disponibiliza e confere os tamanhos reais dos arquivos nos casos pendentes. As associações ficam no backup.");
+                captured.size(), byResource.size(), warning);
         autoOrganizeRecognizedSeries(context, repo);
         return result;
     }
@@ -471,6 +489,256 @@ public final class OriginalAppBridge {
             matched++;
         }
         return matched;
+    }
+
+
+    /**
+     * Resolve conjuntos pequenos (até 4 itens) usando o erro TOTAL da combinação.
+     * Isso elimina o caso em que dois arquivos quase do mesmo tamanho ficam
+     * eternamente pendentes porque cada um parece ambíguo quando analisado sozinho.
+     */
+    private static int matchSmallRemainingSetGlobally(Context context,
+                                                       List<OriginalTitleAccessibilityService.CapturedItem> captured,
+                                                       List<LocalMovieInfo> locals,
+                                                       Map<String, String> byResource,
+                                                       Set<String> usedResources,
+                                                       Set<Integer> usedCaptured) {
+        ArrayList<LocalMovieInfo> leftLocals = new ArrayList<>();
+        ArrayList<Integer> leftCaptured = new ArrayList<>();
+
+        for (LocalMovieInfo local : locals) {
+            if (!usedResources.contains(local.resource)) {
+                if (local.exactSizeBytes <= 0) {
+                    long exact = readActualStoredDownloadSize(context, local.movie, local.resource);
+                    if (exact > 0) local.exactSizeBytes = exact;
+                }
+                leftLocals.add(local);
+            }
+        }
+        for (int i = 0; i < captured.size(); i++) {
+            if (usedCaptured.contains(i)) continue;
+            OriginalTitleAccessibilityService.CapturedItem item = captured.get(i);
+            if (item == null || cleanCapturedTitle(item.title).isEmpty()) continue;
+            if (item.sizeBytes <= 0 && parseDisplayedSizeBinary(item.sizeText) <= 0) continue;
+            leftCaptured.add(i);
+        }
+
+        int n = leftLocals.size();
+        if (n <= 0 || n > 4 || leftCaptured.size() != n) return 0;
+
+        AssignmentSearch search = new AssignmentSearch(n);
+        boolean[] used = new boolean[n];
+        int[] current = new int[n];
+        searchAssignments(0, current, used, leftLocals, leftCaptured, captured, search);
+
+        if (search.bestPermutation == null || Double.isInfinite(search.bestCost)) return 0;
+
+        double avg = search.bestCost / n;
+        boolean clearWinner = search.secondBestCost == Double.POSITIVE_INFINITY
+                || (search.secondBestCost - search.bestCost) >= 0.008d
+                || search.bestCost <= search.secondBestCost * 0.82d;
+        if (search.bestMaxRatio > 0.30d || avg > 0.18d || !clearWinner) return 0;
+
+        int resolved = 0;
+        for (int localIndex = 0; localIndex < n; localIndex++) {
+            int capturedSlot = search.bestPermutation[localIndex];
+            int capturedIndex = leftCaptured.get(capturedSlot);
+            OriginalTitleAccessibilityService.CapturedItem item = captured.get(capturedIndex);
+            LocalMovieInfo local = leftLocals.get(localIndex);
+            String title = cleanCapturedTitle(item.title);
+            if (title.isEmpty()) continue;
+            byResource.put(local.resource, title);
+            if (item.coverPath != null && !item.coverPath.trim().isEmpty()) {
+                saveCoverForResource(context, local.resource, item.coverPath);
+            }
+            usedResources.add(local.resource);
+            usedCaptured.add(capturedIndex);
+            resolved++;
+        }
+        return resolved;
+    }
+
+    private static void searchAssignments(int depth, int[] current, boolean[] used,
+                                          List<LocalMovieInfo> locals,
+                                          List<Integer> capturedIndexes,
+                                          List<OriginalTitleAccessibilityService.CapturedItem> captured,
+                                          AssignmentSearch search) {
+        int n = locals.size();
+        if (depth >= n) {
+            double cost = 0d;
+            double maxRatio = 0d;
+            for (int li = 0; li < n; li++) {
+                LocalMovieInfo local = locals.get(li);
+                OriginalTitleAccessibilityService.CapturedItem item = captured.get(capturedIndexes.get(current[li]));
+                long localSize = local.exactSizeBytes > 0 ? local.exactSizeBytes : local.sizeBytes;
+                long binary = parseDisplayedSizeBinary(item.sizeText);
+                long diff = sizeDifference(localSize, item.sizeBytes, binary);
+                if (localSize <= 0 || diff == Long.MAX_VALUE) return;
+                long reference = Math.max(localSize, Math.max(item.sizeBytes, binary));
+                double ratio = diff / (double) Math.max(1L, reference);
+                cost += ratio;
+                maxRatio = Math.max(maxRatio, ratio);
+            }
+            if (cost < search.bestCost) {
+                search.secondBestCost = search.bestCost;
+                search.bestCost = cost;
+                search.bestMaxRatio = maxRatio;
+                search.bestPermutation = current.clone();
+            } else if (cost < search.secondBestCost) {
+                search.secondBestCost = cost;
+            }
+            return;
+        }
+
+        for (int i = 0; i < n; i++) {
+            if (used[i]) continue;
+            used[i] = true;
+            current[depth] = i;
+            searchAssignments(depth + 1, current, used, locals, capturedIndexes, captured, search);
+            used[i] = false;
+        }
+    }
+
+    private static final class AssignmentSearch {
+        final int n;
+        double bestCost = Double.POSITIVE_INFINITY;
+        double secondBestCost = Double.POSITIVE_INFINITY;
+        double bestMaxRatio = Double.POSITIVE_INFINITY;
+        int[] bestPermutation;
+        AssignmentSearch(int n) { this.n = n; }
+    }
+
+    private static void savePendingResolution(Context context,
+                                              List<OriginalTitleAccessibilityService.CapturedItem> captured,
+                                              List<LocalMovieInfo> locals,
+                                              Set<String> usedResources,
+                                              Set<Integer> usedCaptured) {
+        JSONArray localArr = new JSONArray();
+        JSONArray capturedArr = new JSONArray();
+
+        try {
+            for (LocalMovieInfo local : locals) {
+                if (usedResources.contains(local.resource)) continue;
+                JSONObject o = new JSONObject();
+                o.put("resource", local.resource);
+                o.put("currentTitle", local.movie == null ? "" : local.movie.title);
+                o.put("durationMs", local.movie == null ? 0L : local.movie.durationMs);
+                long localSize = local.exactSizeBytes > 0 ? local.exactSizeBytes : local.sizeBytes;
+                o.put("sizeBytes", localSize);
+                localArr.put(o);
+            }
+
+            for (int i = 0; i < captured.size(); i++) {
+                if (usedCaptured.contains(i)) continue;
+                OriginalTitleAccessibilityService.CapturedItem item = captured.get(i);
+                if (item == null || cleanCapturedTitle(item.title).isEmpty()) continue;
+                JSONObject o = new JSONObject();
+                o.put("title", cleanCapturedTitle(item.title));
+                o.put("sizeBytes", item.sizeBytes);
+                o.put("sizeText", item.sizeText == null ? "" : item.sizeText);
+                o.put("coverPath", item.coverPath == null ? "" : item.coverPath);
+                capturedArr.put(o);
+            }
+        } catch (Exception ignored) {}
+
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+                .putString(KEY_PENDING_LOCALS, localArr.toString())
+                .putString(KEY_PENDING_CAPTURED, capturedArr.toString())
+                .apply();
+    }
+
+    public static List<PendingLocalItem> getPendingLocalItems(Context context) {
+        ArrayList<PendingLocalItem> out = new ArrayList<>();
+        String raw = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .getString(KEY_PENDING_LOCALS, "[]");
+        try {
+            JSONArray arr = new JSONArray(raw == null ? "[]" : raw);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                String resource = normalizeResource(o.optString("resource", ""));
+                if (resource.isEmpty()) continue;
+                out.add(new PendingLocalItem(
+                        resource,
+                        o.optString("currentTitle", ""),
+                        o.optLong("durationMs", 0L),
+                        o.optLong("sizeBytes", 0L)
+                ));
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
+    public static List<PendingCapturedItem> getPendingCapturedItems(Context context) {
+        ArrayList<PendingCapturedItem> out = new ArrayList<>();
+        String raw = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .getString(KEY_PENDING_CAPTURED, "[]");
+        try {
+            JSONArray arr = new JSONArray(raw == null ? "[]" : raw);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                String title = cleanCapturedTitle(o.optString("title", ""));
+                if (title.isEmpty()) continue;
+                out.add(new PendingCapturedItem(
+                        title,
+                        o.optLong("sizeBytes", 0L),
+                        o.optString("sizeText", ""),
+                        o.optString("coverPath", "")
+                ));
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
+    public static boolean saveManualPendingMapping(Context context, MovieRepository repo,
+                                                   String resource, PendingCapturedItem item) {
+        String key = normalizeResource(resource);
+        if (key.isEmpty() || item == null) return false;
+        String title = cleanCapturedTitle(item.title);
+        if (title.isEmpty()) return false;
+
+        Map<String, String> one = new HashMap<>();
+        one.put(key, title);
+        saveMappings(context, one);
+        if (item.coverPath != null && !item.coverPath.trim().isEmpty()) {
+            saveCoverForResource(context, key, item.coverPath);
+        }
+        applySavedMappings(context, repo);
+        return true;
+    }
+
+    public static void clearPendingResolution(Context context) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+                .remove(KEY_PENDING_LOCALS)
+                .remove(KEY_PENDING_CAPTURED)
+                .apply();
+    }
+
+    public static final class PendingLocalItem {
+        public final String resource;
+        public final String currentTitle;
+        public final long durationMs;
+        public final long sizeBytes;
+        PendingLocalItem(String resource, String currentTitle, long durationMs, long sizeBytes) {
+            this.resource = resource == null ? "" : resource;
+            this.currentTitle = currentTitle == null ? "" : currentTitle;
+            this.durationMs = durationMs;
+            this.sizeBytes = sizeBytes;
+        }
+    }
+
+    public static final class PendingCapturedItem {
+        public final String title;
+        public final long sizeBytes;
+        public final String sizeText;
+        public final String coverPath;
+        PendingCapturedItem(String title, long sizeBytes, String sizeText, String coverPath) {
+            this.title = title == null ? "" : title;
+            this.sizeBytes = sizeBytes;
+            this.sizeText = sizeText == null ? "" : sizeText;
+            this.coverPath = coverPath == null ? "" : coverPath;
+        }
     }
 
     private static long sizeDifference(long target, long decimalShown, long binaryShown) {
