@@ -30,6 +30,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.documentfile.provider.DocumentFile;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -564,7 +566,7 @@ public class MainActivity extends Activity {
     private void renderSettings() {
         addPageHeading("Ajustes", "Gerencie sua biblioteca e o Cine Offline.");
 
-        LinearLayout quick = settingsCard("📦", "Importar filme", "Adicionar ZIP ou pasta com index.m3u8 e segmentos .dat/.ts");
+        LinearLayout quick = settingsCard("📦", "Importar filme", "Adicionar ZIP ou pasta com index.m3u8 • ao escolher a pasta Filmes, procura backup automaticamente");
         quick.setOnClickListener(v -> showImportChoice());
         pageContent.addView(quick);
 
@@ -1786,6 +1788,12 @@ public class MainActivity extends Activity {
                     txt -> runOnUiThread(() -> message.setText(txt))
             );
 
+            // Enquanto a pasta já está autorizada, procura um backup da organização
+            // salvo na raiz dela. A restauração só acontece depois da confirmação do usuário.
+            Uri detectedOrganizationBackup = result.fatalError == null
+                    ? findOrganizationBackupInFolder(uri)
+                    : null;
+
             runOnUiThread(() -> {
                 if (!isFinishing()) progress.dismiss();
 
@@ -1815,6 +1823,9 @@ public class MainActivity extends Activity {
 
                 if (result.errors.isEmpty()) {
                     Toast.makeText(this, "🎬 " + summary, Toast.LENGTH_LONG).show();
+                    if (detectedOrganizationBackup != null && !result.movies.isEmpty()) {
+                        showDetectedOrganizationBackup(detectedOrganizationBackup);
+                    }
                 } else {
                     StringBuilder details = new StringBuilder(summary);
                     details.append("\n\nNão foi possível adicionar ").append(result.errors.size()).append(" pasta(s):");
@@ -1822,14 +1833,95 @@ public class MainActivity extends Activity {
                     for (int i = 0; i < limit; i++) details.append("\n• ").append(result.errors.get(i));
                     if (result.errors.size() > limit) details.append("\n• … e mais ").append(result.errors.size() - limit);
 
-                    new AlertDialog.Builder(this)
+                    AlertDialog.Builder done = new AlertDialog.Builder(this)
                             .setTitle("Importação concluída")
-                            .setMessage(details.toString())
-                            .setPositiveButton("OK", null)
-                            .show();
+                            .setMessage(details.toString());
+
+                    if (detectedOrganizationBackup != null && !result.movies.isEmpty()) {
+                        done.setPositiveButton("Continuar", (d, w) ->
+                                showDetectedOrganizationBackup(detectedOrganizationBackup));
+                    } else {
+                        done.setPositiveButton("OK", null);
+                    }
+                    done.show();
                 }
             });
         });
+    }
+
+    /**
+     * Procura somente na raiz da pasta selecionada por um JSON de organização
+     * exportado pelo próprio Cine Offline. Outros JSONs são ignorados.
+     */
+    private Uri findOrganizationBackupInFolder(Uri folderUri) {
+        try {
+            DocumentFile root = DocumentFile.fromTreeUri(this, folderUri);
+            if (root == null || !root.exists() || !root.isDirectory()) return null;
+
+            List<DocumentFile> candidates = new ArrayList<>();
+            for (DocumentFile child : root.listFiles()) {
+                if (child == null || !child.exists() || !child.isFile()) continue;
+                String name = child.getName();
+                String lower = name == null ? "" : name.toLowerCase(Locale.ROOT);
+                String type = child.getType();
+                boolean looksJson = lower.endsWith(".json")
+                        || "application/json".equalsIgnoreCase(type)
+                        || "text/json".equalsIgnoreCase(type);
+                if (looksJson) candidates.add(child);
+            }
+
+            // Se houver mais de um, tenta primeiro o backup modificado mais recentemente.
+            Collections.sort(candidates, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+            for (DocumentFile file : candidates) {
+                if (isCineOrganizationBackup(file.getUri())) return file.getUri();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private boolean isCineOrganizationBackup(Uri uri) {
+        if (uri == null) return false;
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            if (in == null) return false;
+            byte[] buffer = new byte[4096];
+            int total = 0;
+            int n;
+            // O campo "format" é gravado no começo do arquivo. 64 KiB é mais do que suficiente
+            // para reconhecer o backup sem carregar capas Base64 grandes nessa etapa.
+            while (total < 64 * 1024 && (n = in.read(buffer, 0, Math.min(buffer.length, 64 * 1024 - total))) > 0) {
+                bos.write(buffer, 0, n);
+                total += n;
+            }
+            String head = new String(bos.toByteArray(), StandardCharsets.UTF_8);
+            return head.contains("\"format\"")
+                    && head.contains("cine-offline-organization-v1");
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void showDetectedOrganizationBackup(Uri backupUri) {
+        if (backupUri == null || isFinishing()) return;
+
+        String backupName = "cine_offline_backup.json";
+        try (Cursor c = getContentResolver().query(backupUri, null, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0 && c.getString(idx) != null && !c.getString(idx).trim().isEmpty()) {
+                    backupName = c.getString(idx);
+                }
+            }
+        } catch (Exception ignored) {}
+
+        final String shownName = backupName;
+        new AlertDialog.Builder(this)
+                .setTitle("Organização encontrada")
+                .setMessage("Encontrei o backup “" + shownName + "” dentro da pasta Filmes.\n\n" +
+                        "Deseja restaurar agora os nomes, capas, séries, temporadas, episódios, favoritos e progresso?")
+                .setNegativeButton("Agora não", null)
+                .setPositiveButton("Restaurar organização", (d, w) -> readAndRestoreBackup(backupUri))
+                .show();
     }
 
     private void startImport(Uri uri, int mode, String title) {
