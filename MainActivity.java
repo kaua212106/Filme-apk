@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.UriPermission;
 import android.content.res.ColorStateList;
 import android.database.Cursor;
 import android.graphics.Bitmap;
@@ -13,6 +15,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -48,7 +52,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -58,6 +64,14 @@ public class MainActivity extends Activity {
     private static final int REQ_COVER = 1003;
     private static final int REQ_EXPORT_BACKUP = 1004;
     private static final int REQ_IMPORT_BACKUP = 1005;
+    private static final int REQ_AUTO_BACKUP_FOLDER = 1006;
+
+    private static final String PREF_SETTINGS = "cine_offline_settings";
+    private static final String KEY_AUTO_NEXT = "auto_next_episode";
+    private static final String KEY_AUTO_BACKUP = "auto_backup";
+    private static final String KEY_LIBRARY_TREE = "library_tree_uri";
+    private static final String KEY_LAST_AUTO_BACKUP_AT = "last_auto_backup_at";
+    private static final String KEY_LAST_AUTO_BACKUP_SIGNATURE = "last_auto_backup_signature";
 
     private static final int IMPORT_ZIP = 0;
     private static final int IMPORT_FOLDER_LINKED = 1;
@@ -70,6 +84,9 @@ public class MainActivity extends Activity {
     private LinearLayout bottomNav;
     private final List<TextView> navButtons = new ArrayList<>();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler autoBackupHandler = new Handler(Looper.getMainLooper());
+    private SharedPreferences settings;
+    private boolean suppressAutoBackup;
 
     private TextView statMovies;
     private TextView statSeries;
@@ -80,6 +97,20 @@ public class MainActivity extends Activity {
     private Movie pendingCoverMovie;
     private int pendingFolderMode = IMPORT_FOLDER_LINKED;
     private String page = "home";
+    private final Runnable autoBackupRunnable = () -> {
+        if (isFinishing() || suppressAutoBackup || settings == null || !settings.getBoolean(KEY_AUTO_BACKUP, false)) return;
+        final String signature = organizationSignature();
+        if (signature.equals(settings.getString(KEY_LAST_AUTO_BACKUP_SIGNATURE, ""))) return;
+        executor.execute(() -> {
+            boolean ok = writeAutomaticBackup();
+            if (ok) {
+                settings.edit()
+                        .putString(KEY_LAST_AUTO_BACKUP_SIGNATURE, signature)
+                        .putLong(KEY_LAST_AUTO_BACKUP_AT, System.currentTimeMillis())
+                        .apply();
+            }
+        });
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -89,6 +120,7 @@ public class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(0);
         repo = new MovieRepository(this);
         seriesRepo = new SeriesRepository(this);
+        settings = getSharedPreferences(PREF_SETTINGS, MODE_PRIVATE);
         buildUi();
         renderPage();
     }
@@ -97,10 +129,12 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (repo != null && pageContent != null) renderPage();
+        scheduleAutoBackup();
     }
 
     @Override
     protected void onDestroy() {
+        autoBackupHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
         super.onDestroy();
     }
@@ -235,6 +269,7 @@ public class MainActivity extends Activity {
         else if (page.equals("history")) renderHistory();
         else if (page.startsWith("series:")) renderSeriesDetail(page.substring("series:".length()));
         else renderSettings();
+        scheduleAutoBackup();
     }
 
     private void renderHome() {
@@ -273,6 +308,8 @@ public class MainActivity extends Activity {
         statsLp.setMargins(0, 0, 0, dp(14));
         pageContent.addView(stats, statsLp);
 
+        pageContent.addView(remainingTimeCard(all));
+
         pageContent.addView(homeSection("▶", "Continuar", "Ver lista", continuing,
                 "Nada em andamento", "Quando você parar um filme no meio, ele aparece aqui.", "continue"));
 
@@ -293,6 +330,54 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
         rp.setMargins(0, dp(2), 0, dp(8));
         pageContent.addView(random, rp);
+    }
+
+    private View remainingTimeCard(List<Movie> movies) {
+        long total = 0L;
+        long remaining = 0L;
+        long movieRemaining = 0L;
+        long seriesRemaining = 0L;
+        int watchedCount = 0;
+        int known = 0;
+        for (Movie m : movies) {
+            if (m == null || m.durationMs <= 0) continue;
+            known++;
+            total += m.durationMs;
+            long itemRemaining = 0L;
+            if (m.watched) {
+                watchedCount++;
+            } else {
+                itemRemaining = Math.max(0L, m.durationMs - Math.max(0L, m.progressMs));
+                remaining += itemRemaining;
+            }
+            if (seriesRepo.getAssignment(m.id) == null) movieRemaining += itemRemaining;
+            else seriesRemaining += itemRemaining;
+        }
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(18), dp(15), dp(18), dp(15));
+        Ui.card(card, this, 22);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, 0, dp(14));
+        card.setLayoutParams(lp);
+
+        TextView label = text("⏱ Tempo disponível para assistir", 14, true, Ui.TEXT);
+        card.addView(label);
+        TextView value = text(formatLongTime(remaining), 28, true, Ui.BLUE);
+        value.setPadding(0, dp(4), 0, dp(2));
+        card.addView(value);
+
+        StringBuilder sub = new StringBuilder();
+        sub.append("Filmes restantes: ").append(formatLongTime(movieRemaining))
+                .append(" • Séries restantes: ").append(formatLongTime(seriesRemaining))
+                .append("\nTotal original: ").append(formatLongTime(total));
+        if (known > 0) sub.append(" • ").append(watchedCount).append(" concluído(s)");
+        long bytes = LibraryHealth.getTotalBytes(this);
+        if (bytes > 0) sub.append(" • ").append(LibraryHealth.formatBytes(bytes));
+        TextView details = text(sub.toString(), 10, false, Ui.MUTED);
+        card.addView(details);
+        return card;
     }
 
     private TextView homeStat(LinearLayout parent, String number, String label) {
@@ -549,7 +634,7 @@ public class MainActivity extends Activity {
     private void confirmClearHistory() {
         new AlertDialog.Builder(this)
                 .setTitle("Limpar histórico?")
-                .setMessage("Isso remove a lista de assistidos/reproduzidos recentemente. O progresso salvo de cada filme ou episódio não será apagado.")
+                .setMessage("Isso limpa apenas a lista de reproduções recentes. O progresso e o status ‘Assistido’ de cada filme ou episódio serão preservados.")
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Limpar", (d, w) -> {
                     List<Movie> all = repo.getAll();
@@ -570,6 +655,44 @@ public class MainActivity extends Activity {
         LinearLayout quick = settingsCard("📦", "Importar filme", "Adicionar ZIP ou pasta com index.m3u8 • ao escolher a pasta Filmes, procura backup automaticamente");
         quick.setOnClickListener(v -> showImportChoice());
         pageContent.addView(quick);
+
+        Uri libraryUri = getStoredLibraryUri();
+        LinearLayout scanNew = settingsCard("↻", "Procurar novos conteúdos",
+                libraryUri == null ? "Selecione a pasta Filmes uma vez para ativar" : "Procura somente o que ainda não está na biblioteca");
+        scanNew.setOnClickListener(v -> scanForNewContent());
+        pageContent.addView(scanNew);
+
+        long lastCheck = LibraryHealth.getLastCheck(this);
+        int lastMissing = LibraryHealth.getLastMissing(this);
+        int lastBad = LibraryHealth.getLastBadMovies(this);
+        long libraryBytes = LibraryHealth.getTotalBytes(this);
+        String verifySub;
+        if (lastCheck <= 0) verifySub = "Confere playlists e todos os segmentos • também calcula o espaço ocupado";
+        else if (lastMissing == 0 && lastBad == 0) verifySub = "✅ Última verificação sem erros • " + LibraryHealth.formatBytes(libraryBytes);
+        else verifySub = "⚠ " + lastBad + " item(ns) com problema • " + lastMissing + " segmento(s) ausente(s)";
+        LinearLayout verify = settingsCard("✓", "Verificar biblioteca", verifySub);
+        verify.setOnClickListener(v -> verifyLibrary());
+        pageContent.addView(verify);
+
+        boolean autoBackup = settings.getBoolean(KEY_AUTO_BACKUP, false);
+        boolean canAutoBackup = getStoredLibraryUri() != null && hasPersistedWritePermission(getStoredLibraryUri());
+        long lastAuto = settings.getLong(KEY_LAST_AUTO_BACKUP_AT, 0L);
+        String autoBackupSub = !canAutoBackup
+                ? "Toque para escolher a pasta Filmes e permitir atualizar o JSON automaticamente"
+                : (autoBackup ? "Ativado" + (lastAuto > 0 ? " • último " + relativeDate(lastAuto) : " • salva após alterações")
+                : "Desativado • toque para ativar");
+        LinearLayout autoBackupCard = settingsCard("💾", "Backup automático na pasta Filmes", autoBackupSub);
+        autoBackupCard.setOnClickListener(v -> toggleAutoBackup());
+        pageContent.addView(autoBackupCard);
+
+        boolean autoNext = settings.getBoolean(KEY_AUTO_NEXT, false);
+        LinearLayout autoNextCard = settingsCard("⏭", "Próximo episódio automático",
+                autoNext ? "Ativado • ao terminar um episódio, abre o próximo da série" : "Desativado • toque para ativar");
+        autoNextCard.setOnClickListener(v -> {
+            settings.edit().putBoolean(KEY_AUTO_NEXT, !autoNext).apply();
+            renderPage();
+        });
+        pageContent.addView(autoNextCard);
 
         LinearLayout createSeries = settingsCard("▤", "Criar série", "Agrupe episódios e organize por temporada e número do episódio");
         createSeries.setOnClickListener(v -> showCreateSeriesDialog());
@@ -1144,10 +1267,21 @@ public class MainActivity extends Activity {
         TextView name = text(series.name, 16, true, Ui.TEXT);
         name.setMaxLines(2);
         words.addView(name);
-        int episodes = seriesRepo.countMovies(series.id);
+        List<SeriesRepository.Assignment> seriesAssignments = seriesRepo.getAssignmentsForSeries(series.id);
+        int episodes = seriesAssignments.size();
         int seasons = seriesRepo.countSeasons(series.id);
+        int watchedEpisodes = 0;
+        long seriesBytes = 0L;
+        for (SeriesRepository.Assignment a : seriesAssignments) {
+            Movie episodeMovie = repo.getById(a.movieId);
+            if (episodeMovie == null) continue;
+            if (episodeMovie.watched) watchedEpisodes++;
+            seriesBytes += LibraryHealth.getMovieBytes(this, episodeMovie);
+        }
         String details = episodes + (episodes == 1 ? " episódio" : " episódios");
         if (seasons > 0) details += " • " + seasons + (seasons == 1 ? " temporada" : " temporadas");
+        if (episodes > 0) details += " • " + watchedEpisodes + "/" + episodes + " assistidos";
+        if (seriesBytes > 0) details += " • " + LibraryHealth.formatBytes(seriesBytes);
         TextView sub = text(details, 10, false, Ui.MUTED);
         sub.setPadding(0, dp(4), 0, 0);
         words.addView(sub);
@@ -1492,7 +1626,8 @@ public class MainActivity extends Activity {
                 "Renomear",
                 "Alterar capa",
                 assignment == null ? "Adicionar a uma série" : "Editar série / episódio",
-                "Zerar progresso",
+                m.watched ? "Marcar como não assistido" : "Marcar como assistido",
+                "Zerar progresso / assistir de novo",
                 "Excluir filme"
         };
         new AlertDialog.Builder(this)
@@ -1502,7 +1637,8 @@ public class MainActivity extends Activity {
                     else if (which == 1) renameMovie(m);
                     else if (which == 2) pickCover(m);
                     else if (which == 3) showSeriesAssignmentDialog(m);
-                    else if (which == 4) { m.progressMs = 0; repo.save(m); renderPage(); }
+                    else if (which == 4) { m.watched = !m.watched; if (m.watched) m.progressMs = 0; repo.save(m); renderPage(); }
+                    else if (which == 5) { m.progressMs = 0; m.watched = false; repo.save(m); renderPage(); }
                     else confirmDelete(m);
                 }).show();
     }
@@ -1541,7 +1677,7 @@ public class MainActivity extends Activity {
                         ? "O filme será removido da biblioteca. Os arquivos originais da pasta NÃO serão apagados."
                         : "A cópia importada pelo Cine Offline será apagada do armazenamento interno do app.")
                 .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Excluir", (d, w) -> { seriesRepo.unassign(m.id); repo.delete(m); renderPage(); })
+                .setPositiveButton("Excluir", (d, w) -> { seriesRepo.unassign(m.id); LibraryHealth.forgetMovie(this, m); repo.delete(m); renderPage(); })
                 .show();
     }
 
@@ -1670,8 +1806,125 @@ public class MainActivity extends Activity {
     private void pickFolder(int mode) {
         pendingFolderMode = mode;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         startActivityForResult(i, REQ_FOLDER);
+    }
+
+    private void chooseAutoBackupFolder() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(i, REQ_AUTO_BACKUP_FOLDER);
+    }
+
+    private Uri getStoredLibraryUri() {
+        if (settings != null) {
+            String raw = settings.getString(KEY_LIBRARY_TREE, "");
+            if (raw != null && !raw.trim().isEmpty()) {
+                try { return Uri.parse(raw); } catch (Exception ignored) {}
+            }
+        }
+        // Compatibilidade com bibliotecas importadas antes desta versão.
+        if (repo != null) {
+            for (Movie m : repo.getAll()) {
+                if (m != null && m.isLinked() && m.sourceUri != null && !m.sourceUri.trim().isEmpty()) {
+                    try { return Uri.parse(m.sourceUri); } catch (Exception ignored) {}
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean hasPersistedWritePermission(Uri uri) {
+        if (uri == null) return false;
+        try {
+            for (UriPermission p : getContentResolver().getPersistedUriPermissions()) {
+                if (uri.equals(p.getUri()) && p.isReadPermission() && p.isWritePermission()) return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private void toggleAutoBackup() {
+        Uri root = getStoredLibraryUri();
+        if (root == null || !hasPersistedWritePermission(root)) {
+            chooseAutoBackupFolder();
+            return;
+        }
+        boolean enabled = settings.getBoolean(KEY_AUTO_BACKUP, false);
+        settings.edit().putBoolean(KEY_AUTO_BACKUP, !enabled).apply();
+        if (!enabled) {
+            settings.edit().remove(KEY_LAST_AUTO_BACKUP_SIGNATURE).apply();
+            scheduleAutoBackup();
+            Toast.makeText(this, "Backup automático ativado.", Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "Backup automático desativado.", Toast.LENGTH_SHORT).show();
+        }
+        renderPage();
+    }
+
+    private void scanForNewContent() {
+        Uri root = getStoredLibraryUri();
+        if (root == null) {
+            Toast.makeText(this, "Selecione a pasta Filmes primeiro.", Toast.LENGTH_LONG).show();
+            pickFolder(IMPORT_LIBRARY_LINKED);
+            return;
+        }
+        startLibraryImport(root);
+    }
+
+    private void verifyLibrary() {
+        List<Movie> movies = repo.getAll();
+        if (movies.isEmpty()) {
+            Toast.makeText(this, "A biblioteca está vazia.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(24), dp(22), dp(24), dp(16));
+        ProgressBar spinner = new ProgressBar(this);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(Ui.PURPLE));
+        content.addView(spinner, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView message = text("🔎 Preparando verificação…", 12, false, Ui.MUTED);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, dp(14), 0, 0);
+        content.addView(message);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Verificando biblioteca")
+                .setView(content)
+                .setMessage("Isso pode demorar um pouco porque todos os segmentos serão conferidos.")
+                .setCancelable(false)
+                .create();
+        dialog.show();
+
+        executor.execute(() -> {
+            LibraryHealth.CheckResult result = LibraryHealth.verify(getApplicationContext(), movies,
+                    txt -> runOnUiThread(() -> message.setText(txt)));
+            runOnUiThread(() -> {
+                if (!isFinishing()) dialog.dismiss();
+                renderPage();
+                StringBuilder out = new StringBuilder();
+                out.append(result.healthyMovies).append(" de ").append(result.movieCount)
+                        .append(" item(ns) sem erro.\n")
+                        .append(result.segmentCount).append(" segmento(s) conferido(s).\n")
+                        .append("Espaço da biblioteca: ").append(LibraryHealth.formatBytes(result.totalBytes)).append(".\n");
+                if (result.missingSegments == 0 && result.badMovies == 0) {
+                    out.append("\n✅ Nenhum arquivo ausente encontrado.");
+                } else {
+                    out.append("\n⚠ ").append(result.missingSegments).append(" segmento(s) ausente(s).\n");
+                    for (String problem : result.problems) out.append("\n• ").append(problem);
+                }
+                new AlertDialog.Builder(this)
+                        .setTitle(result.badMovies == 0 ? "Biblioteca íntegra" : "Problemas encontrados")
+                        .setMessage(out.toString())
+                        .setPositiveButton("OK", null)
+                        .show();
+            });
+        });
     }
 
     private void createBackupDocument() {
@@ -1696,6 +1949,22 @@ public class MainActivity extends Activity {
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
 
+        if (requestCode == REQ_AUTO_BACKUP_FOLDER) {
+            try {
+                int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(uri, flags);
+            } catch (Exception ignored) {}
+            settings.edit()
+                    .putString(KEY_LIBRARY_TREE, uri.toString())
+                    .putBoolean(KEY_AUTO_BACKUP, true)
+                    .remove(KEY_LAST_AUTO_BACKUP_SIGNATURE)
+                    .apply();
+            scheduleAutoBackup();
+            renderPage();
+            Toast.makeText(this, "Backup automático ativado na pasta selecionada.", Toast.LENGTH_LONG).show();
+            return;
+        }
+
         if (requestCode == REQ_EXPORT_BACKUP) {
             writeBackup(uri);
             return;
@@ -1710,13 +1979,14 @@ public class MainActivity extends Activity {
             // Só o modo rápido precisa manter acesso permanente à pasta original.
             if (pendingFolderMode == IMPORT_FOLDER_LINKED || pendingFolderMode == IMPORT_LIBRARY_LINKED) {
                 try {
-                    int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+                    int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
                     if ((flags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
                         getContentResolver().takePersistableUriPermission(uri, flags);
                     }
                 } catch (Exception ignored) {}
             }
             if (pendingFolderMode == IMPORT_LIBRARY_LINKED) {
+                settings.edit().putString(KEY_LIBRARY_TREE, uri.toString()).apply();
                 startLibraryImport(uri);
             } else {
                 askTitleAndImport(uri, pendingFolderMode, "Filme offline");
@@ -1762,6 +2032,15 @@ public class MainActivity extends Activity {
     }
 
     private void startLibraryImport(Uri uri) {
+        if (uri == null) return;
+        suppressAutoBackup = true;
+        settings.edit().putString(KEY_LIBRARY_TREE, uri.toString()).apply();
+        if (hasPersistedWritePermission(uri) && !settings.contains(KEY_AUTO_BACKUP)) {
+            // Primeira configuração: ativa por padrão. Se o usuário já desligou manualmente,
+            // respeita a escolha e não reativa ao procurar novos conteúdos.
+            settings.edit().putBoolean(KEY_AUTO_BACKUP, true).apply();
+        }
+
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -1777,55 +2056,79 @@ public class MainActivity extends Activity {
         content.addView(message);
 
         AlertDialog progress = new AlertDialog.Builder(this)
-                .setTitle("Adicionando biblioteca")
+                .setTitle("Atualizando biblioteca")
                 .setView(content)
                 .setCancelable(false)
                 .create();
         progress.show();
 
         executor.execute(() -> {
+            List<Movie> before = repo.getAll();
+            boolean libraryWasEmpty = before.isEmpty();
+            Set<String> existingKeys = new HashSet<>();
+            for (Movie old : before) existingKeys.add(stableMovieKey(old));
+
             MovieImporter.LibraryImportResult result = MovieImporter.importLibraryFolderLinked(
                     getApplicationContext(), uri,
                     txt -> runOnUiThread(() -> message.setText(txt))
             );
 
-            // Enquanto a pasta já está autorizada, procura um backup da organização
-            // salvo na raiz dela. A restauração só acontece depois da confirmação do usuário.
-            Uri detectedOrganizationBackup = result.fatalError == null
+            List<Movie> fresh = new ArrayList<>();
+            int duplicates = 0;
+            if (result.fatalError == null) {
+                for (Movie imported : result.movies) {
+                    String key = stableMovieKey(imported);
+                    if (existingKeys.contains(key)) {
+                        duplicates++;
+                        deleteImportedShell(imported);
+                    } else {
+                        existingKeys.add(key);
+                        fresh.add(imported);
+                    }
+                }
+            }
+
+            // Só oferece restauração automática quando a biblioteca estava vazia. Assim o
+            // botão "Procurar novos conteúdos" não fica perguntando sobre o mesmo JSON sempre.
+            Uri detectedOrganizationBackup = result.fatalError == null && libraryWasEmpty
                     ? findOrganizationBackupInFolder(uri)
                     : null;
+            final int duplicatesFinal = duplicates;
 
             runOnUiThread(() -> {
                 if (!isFinishing()) progress.dismiss();
 
                 if (result.fatalError != null) {
+                    suppressAutoBackup = false;
                     new AlertDialog.Builder(this)
-                            .setTitle("Não foi possível adicionar a pasta")
+                            .setTitle("Não foi possível ler a pasta")
                             .setMessage(result.fatalError)
                             .setPositiveButton("OK", null)
                             .show();
                     return;
                 }
 
-                // Grava a biblioteca inteira em uma única operação. Antes cada filme
-                // reabria e regravava o JSON completo, o que ficava lento com dezenas de itens.
-                repo.saveAll(result.movies);
+                repo.saveAll(fresh);
+                if (!fresh.isEmpty()) LibraryHealth.invalidateTotals(this);
 
-                if (!result.movies.isEmpty()) {
+                if (!fresh.isEmpty()) {
                     page = "library";
                     updateBottomNav();
                     renderPage();
-                    // Não gera 47 capas logo após a importação. Abrir dezenas de segmentos
-                    // de vídeo em sequência deixava o celular ocupado mesmo depois da lista aparecer.
                 }
 
-                String summary = result.movies.size() + (result.movies.size() == 1 ? " filme adicionado" : " filmes adicionados")
-                        + " de " + result.discovered + " encontrado(s).";
+                StringBuilder summary = new StringBuilder();
+                summary.append(fresh.size()).append(fresh.size() == 1 ? " conteúdo novo adicionado" : " conteúdos novos adicionados");
+                if (duplicatesFinal > 0) summary.append(" • ").append(duplicatesFinal).append(" já existia(m)");
+                summary.append(" • ").append(result.discovered).append(" encontrado(s)");
 
                 if (result.errors.isEmpty()) {
                     Toast.makeText(this, "🎬 " + summary, Toast.LENGTH_LONG).show();
-                    if (detectedOrganizationBackup != null && !result.movies.isEmpty()) {
+                    if (detectedOrganizationBackup != null) {
                         showDetectedOrganizationBackup(detectedOrganizationBackup);
+                    } else {
+                        suppressAutoBackup = false;
+                        scheduleAutoBackup();
                     }
                 } else {
                     StringBuilder details = new StringBuilder(summary);
@@ -1835,19 +2138,43 @@ public class MainActivity extends Activity {
                     if (result.errors.size() > limit) details.append("\n• … e mais ").append(result.errors.size() - limit);
 
                     AlertDialog.Builder done = new AlertDialog.Builder(this)
-                            .setTitle("Importação concluída")
+                            .setTitle("Atualização concluída")
                             .setMessage(details.toString());
 
-                    if (detectedOrganizationBackup != null && !result.movies.isEmpty()) {
-                        done.setPositiveButton("Continuar", (d, w) ->
-                                showDetectedOrganizationBackup(detectedOrganizationBackup));
+                    if (detectedOrganizationBackup != null) {
+                        done.setPositiveButton("Continuar", (d, w) -> showDetectedOrganizationBackup(detectedOrganizationBackup));
                     } else {
-                        done.setPositiveButton("OK", null);
+                        done.setPositiveButton("OK", (d, w) -> {
+                            suppressAutoBackup = false;
+                            scheduleAutoBackup();
+                        });
                     }
+                    done.setOnDismissListener(d -> {
+                        if (detectedOrganizationBackup == null) {
+                            suppressAutoBackup = false;
+                            scheduleAutoBackup();
+                        }
+                    });
+                    done.setOnCancelListener(d -> suppressAutoBackup = false);
                     done.show();
                 }
             });
         });
+    }
+
+    private void deleteImportedShell(Movie movie) {
+        if (movie == null || movie.folderPath == null || movie.folderPath.trim().isEmpty()) return;
+        deleteFileTree(new File(movie.folderPath));
+    }
+
+    private void deleteFileTree(File file) {
+        if (file == null || !file.exists()) return;
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) for (File child : children) deleteFileTree(child);
+        }
+        //noinspection ResultOfMethodCallIgnored
+        file.delete();
     }
 
     /**
@@ -1920,8 +2247,12 @@ public class MainActivity extends Activity {
                 .setTitle("Organização encontrada")
                 .setMessage("Encontrei o backup “" + shownName + "” dentro da pasta Filmes.\n\n" +
                         "Deseja restaurar agora os nomes, capas, séries, temporadas, episódios, favoritos e progresso?")
-                .setNegativeButton("Agora não", null)
+                .setNegativeButton("Agora não", (d, w) -> {
+                    suppressAutoBackup = false;
+                    // Não sobrescreve o arquivo imediatamente se o usuário decidiu não restaurar.
+                })
                 .setPositiveButton("Restaurar organização", (d, w) -> readAndRestoreBackup(backupUri))
+                .setOnCancelListener(d -> suppressAutoBackup = false)
                 .show();
     }
 
@@ -1961,6 +2292,7 @@ public class MainActivity extends Activity {
                 if (!isFinishing()) progress.dismiss();
                 if (result.ok) {
                     repo.save(result.movie);
+                    LibraryHealth.invalidateTotals(this);
                     page = "library";
                     updateBottomNav();
                     renderPage();
@@ -1985,80 +2317,154 @@ public class MainActivity extends Activity {
         });
     }
 
+    private static final class BackupBuild {
+        final JSONObject root;
+        final int items;
+        final int covers;
+        BackupBuild(JSONObject root, int items, int covers) {
+            this.root = root;
+            this.items = items;
+            this.covers = covers;
+        }
+    }
+
+    private BackupBuild buildBackupJson() throws Exception {
+        JSONObject root = new JSONObject();
+        root.put("format", "cine-offline-organization-v1");
+        root.put("createdAt", System.currentTimeMillis());
+
+        List<Movie> all = repo.getAll();
+        JSONArray movies = new JSONArray();
+        JSONObject libraryCovers = new JSONObject();
+        int libraryCoverCount = 0;
+        Map<String, Movie> byId = new HashMap<>();
+        for (Movie m : all) {
+            byId.put(m.id, m);
+            String movieKey = stableMovieKey(m);
+            JSONObject o = new JSONObject();
+            o.put("key", movieKey);
+            o.put("title", m.title);
+            o.put("durationMs", m.durationMs);
+            o.put("favorite", m.favorite);
+            o.put("progressMs", m.progressMs);
+            o.put("lastPlayedAt", m.lastPlayedAt);
+            o.put("playCount", m.playCount);
+            o.put("watched", m.watched);
+            movies.put(o);
+
+            // Salva a capa REAL da biblioteca, inclusive capas escolhidas manualmente.
+            String coverBase64 = encodeMovieCoverForBackup(m);
+            if (!coverBase64.isEmpty()) {
+                libraryCovers.put(movieKey, coverBase64);
+                libraryCoverCount++;
+            }
+        }
+        root.put("movies", movies);
+        root.put("libraryCovers", libraryCovers);
+
+        JSONArray series = new JSONArray();
+        for (SeriesRepository.SeriesInfo item : seriesRepo.getAllSeries()) {
+            JSONObject o = new JSONObject();
+            o.put("id", item.id);
+            o.put("name", item.name);
+            series.put(o);
+        }
+        root.put("series", series);
+
+        JSONArray assignments = new JSONArray();
+        for (SeriesRepository.SeriesInfo item : seriesRepo.getAllSeries()) {
+            for (SeriesRepository.Assignment a : seriesRepo.getAssignmentsForSeries(item.id)) {
+                Movie m = byId.get(a.movieId);
+                if (m == null) continue;
+                JSONObject o = new JSONObject();
+                o.put("movieKey", stableMovieKey(m));
+                o.put("seriesId", a.seriesId);
+                o.put("season", a.season);
+                o.put("episode", a.episode);
+                assignments.put(o);
+            }
+        }
+        root.put("assignments", assignments);
+        root.put("originalMappings", OriginalAppBridge.exportSavedMappings(this));
+        root.put("originalCovers", OriginalAppBridge.exportSavedCovers(this));
+        return new BackupBuild(root, all.size(), libraryCoverCount);
+    }
+
     private void writeBackup(Uri uri) {
         try {
-            JSONObject root = new JSONObject();
-            root.put("format", "cine-offline-organization-v1");
-            root.put("createdAt", System.currentTimeMillis());
-
-            List<Movie> all = repo.getAll();
-            JSONArray movies = new JSONArray();
-            JSONObject libraryCovers = new JSONObject();
-            int libraryCoverCount = 0;
-            Map<String, Movie> byId = new HashMap<>();
-            for (Movie m : all) {
-                byId.put(m.id, m);
-                String movieKey = stableMovieKey(m);
-                JSONObject o = new JSONObject();
-                o.put("key", movieKey);
-                // O título que está visível na biblioteca é a fonte de verdade do backup.
-                // Isso inclui qualquer renomeação feita manualmente pelo usuário.
-                o.put("title", m.title);
-                o.put("durationMs", m.durationMs);
-                o.put("favorite", m.favorite);
-                o.put("progressMs", m.progressMs);
-                o.put("lastPlayedAt", m.lastPlayedAt);
-                o.put("playCount", m.playCount);
-                movies.put(o);
-
-                // Salva a capa REAL que está sendo usada na biblioteca, e não apenas
-                // as capas capturadas do app original. Assim capas escolhidas manualmente
-                // também sobrevivem a uma reinstalação/restauração.
-                String coverBase64 = encodeMovieCoverForBackup(m);
-                if (!coverBase64.isEmpty()) {
-                    libraryCovers.put(movieKey, coverBase64);
-                    libraryCoverCount++;
-                }
-            }
-            root.put("movies", movies);
-            root.put("libraryCovers", libraryCovers);
-
-            JSONArray series = new JSONArray();
-            for (SeriesRepository.SeriesInfo item : seriesRepo.getAllSeries()) {
-                JSONObject o = new JSONObject();
-                o.put("id", item.id);
-                o.put("name", item.name);
-                series.put(o);
-            }
-            root.put("series", series);
-
-            JSONArray assignments = new JSONArray();
-            for (SeriesRepository.SeriesInfo item : seriesRepo.getAllSeries()) {
-                for (SeriesRepository.Assignment a : seriesRepo.getAssignmentsForSeries(item.id)) {
-                    Movie m = byId.get(a.movieId);
-                    if (m == null) continue;
-                    JSONObject o = new JSONObject();
-                    o.put("movieKey", stableMovieKey(m));
-                    o.put("seriesId", a.seriesId);
-                    o.put("season", a.season);
-                    o.put("episode", a.episode);
-                    assignments.put(o);
-                }
-            }
-            root.put("assignments", assignments);
-
-            // Também guarda a relação estável código da pasta -> nome capturado no app original.
-            root.put("originalMappings", OriginalAppBridge.exportSavedMappings(this));
-            root.put("originalCovers", OriginalAppBridge.exportSavedCovers(this));
-
+            BackupBuild backup = buildBackupJson();
             try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
                 if (out == null) throw new Exception("Não foi possível abrir o arquivo de destino.");
-                out.write(root.toString(2).getBytes(StandardCharsets.UTF_8));
+                out.write(backup.root.toString(2).getBytes(StandardCharsets.UTF_8));
             }
-            Toast.makeText(this, "Backup salvo: " + all.size() + " item(ns) e "
-                    + libraryCoverCount + " capa(s) atuais incluída(s).", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Backup salvo: " + backup.items + " item(ns) e "
+                    + backup.covers + " capa(s) atuais incluída(s).", Toast.LENGTH_LONG).show();
+            // Se o backup automático estiver ativo, atualiza também a cópia fixa da pasta Filmes.
+            scheduleAutoBackup();
         } catch (Exception e) {
             Toast.makeText(this, "Falha ao criar backup: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void scheduleAutoBackup() {
+        if (settings == null || suppressAutoBackup || !settings.getBoolean(KEY_AUTO_BACKUP, false)) return;
+        Uri root = getStoredLibraryUri();
+        if (root == null || !hasPersistedWritePermission(root)) return;
+        autoBackupHandler.removeCallbacks(autoBackupRunnable);
+        autoBackupHandler.postDelayed(autoBackupRunnable, 1400);
+    }
+
+    private String organizationSignature() {
+        StringBuilder b = new StringBuilder();
+        List<Movie> movies = repo == null ? new ArrayList<>() : repo.getAll();
+        for (Movie m : movies) {
+            b.append(m.id).append('|')
+                    .append(m.title).append('|')
+                    .append(m.favorite).append('|')
+                    .append(m.progressMs).append('|')
+                    .append(m.lastPlayedAt).append('|')
+                    .append(m.playCount).append('|')
+                    .append(m.watched).append('|')
+                    .append(m.durationMs).append(';');
+            File cover = m.coverPath == null ? null : new File(m.coverPath);
+            if (cover != null && cover.exists()) {
+                b.append(cover.length()).append('@').append(cover.lastModified());
+            }
+            b.append(';');
+        }
+        if (seriesRepo != null) {
+            for (SeriesRepository.SeriesInfo info : seriesRepo.getAllSeries()) {
+                b.append("S:").append(info.id).append(':').append(info.name).append(';');
+                for (SeriesRepository.Assignment a : seriesRepo.getAssignmentsForSeries(info.id)) {
+                    b.append("A:").append(a.movieId).append(':').append(a.season).append(':').append(a.episode).append(';');
+                }
+            }
+        }
+        b.append("M:").append(OriginalAppBridge.getSavedMappingCount(this));
+        return Integer.toHexString(b.toString().hashCode()) + ":" + b.length();
+    }
+
+    private boolean writeAutomaticBackup() {
+        try {
+            Uri treeUri = getStoredLibraryUri();
+            if (treeUri == null || !hasPersistedWritePermission(treeUri)) return false;
+            DocumentFile root = DocumentFile.fromTreeUri(this, treeUri);
+            if (root == null || !root.exists() || !root.isDirectory()) return false;
+
+            DocumentFile file = root.findFile("cine_offline_backup.json");
+            if (file == null || !file.exists()) {
+                file = root.createFile("application/json", "cine_offline_backup.json");
+            }
+            if (file == null) return false;
+
+            BackupBuild backup = buildBackupJson();
+            try (OutputStream out = getContentResolver().openOutputStream(file.getUri(), "w")) {
+                if (out == null) return false;
+                out.write(backup.root.toString(2).getBytes(StandardCharsets.UTF_8));
+            }
+            return true;
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
@@ -2079,6 +2485,7 @@ public class MainActivity extends Activity {
             }
             restoreBackup(root);
         } catch (Exception e) {
+            suppressAutoBackup = false;
             Toast.makeText(this, "Falha ao restaurar backup: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
@@ -2134,6 +2541,7 @@ public class MainActivity extends Activity {
                 target.progressMs = Math.max(0, o.optLong("progressMs", target.progressMs));
                 target.lastPlayedAt = Math.max(0, o.optLong("lastPlayedAt", target.lastPlayedAt));
                 target.playCount = Math.max(0, o.optInt("playCount", target.playCount));
+                target.watched = o.optBoolean("watched", target.watched);
 
                 // Nas versões novas do backup, libraryCovers contém a capa atual da
                 // biblioteca (inclusive a escolhida manualmente). Ela também tem prioridade
@@ -2200,6 +2608,10 @@ public class MainActivity extends Activity {
             restoreMessage.append("Backup antigo: usando as capas capturadas disponíveis.\n");
         }
         restoreMessage.append(coversAvailable).append(" capa(s) disponível(is) na biblioteca agora.");
+
+        suppressAutoBackup = false;
+        settings.edit().remove(KEY_LAST_AUTO_BACKUP_SIGNATURE).apply();
+        scheduleAutoBackup();
 
         new AlertDialog.Builder(this)
                 .setTitle("Backup restaurado")
@@ -2381,20 +2793,31 @@ public class MainActivity extends Activity {
 
     private void showAbout() {
         new AlertDialog.Builder(this)
-                .setTitle("Cine Offline 3.3")
-                .setMessage("Player local para filmes HLS salvos como index.m3u8 + segmentos .dat/.ts.\n\nRecursos: biblioteca, busca, favoritos, histórico, continuar de onde parou, capa automática, capa personalizada, velocidade, avanço/retorno de 10 s e tela cheia.\n\nA reprodução dos filmes importados não usa internet.")
+                .setTitle("Cine Offline 4.0")
+                .setMessage("Player local para filmes HLS salvos como index.m3u8 + segmentos .dat/.ts.\n\nRecursos: biblioteca, séries, continuar assistindo, tempo restante real, favoritos, histórico, capas, backup automático, verificação de arquivos, cálculo de armazenamento, procura de novos conteúdos e próximo episódio automático.\n\nA reprodução dos filmes importados não usa internet.")
                 .setPositiveButton("OK", null).show();
     }
 
     private boolean isContinue(Movie m) {
-        return m.progressMs > 15_000 && (m.durationMs <= 0 || m.progressMs < m.durationMs - 30_000);
+        return !m.watched && m.progressMs > 15_000
+                && (m.durationMs <= 0 || m.progressMs < m.durationMs - 30_000);
     }
 
     private String progressText(Movie m) {
-        if (m.durationMs <= 0) return m.progressMs > 0 ? "Progresso salvo em " + time(m.progressMs) : "Pronto para assistir offline";
-        int pct = (int) Math.min(100, Math.round((m.progressMs * 100.0) / m.durationMs));
-        if (m.progressMs < 15_000) return "Duração: " + time(m.durationMs);
-        return time(m.progressMs) + " / " + time(m.durationMs) + " • " + pct + "%";
+        String base;
+        if (m.watched) {
+            base = m.durationMs > 0 ? "✅ Assistido • " + time(m.durationMs) : "✅ Assistido";
+        } else if (m.durationMs <= 0) {
+            base = m.progressMs > 0 ? "Progresso salvo em " + time(m.progressMs) : "Pronto para assistir offline";
+        } else {
+            int pct = (int) Math.min(100, Math.round((m.progressMs * 100.0) / m.durationMs));
+            base = m.progressMs < 15_000
+                    ? "Duração: " + time(m.durationMs)
+                    : time(m.progressMs) + " / " + time(m.durationMs) + " • " + pct + "%";
+        }
+        long bytes = LibraryHealth.getMovieBytes(this, m);
+        if (bytes > 0) base += " • " + LibraryHealth.formatBytes(bytes);
+        return base;
     }
 
     private String relativeDate(long ts) {
@@ -2406,6 +2829,16 @@ public class MainActivity extends Activity {
         if (h < 24) return "há " + h + " h";
         long d = h / 24;
         return "há " + d + (d == 1 ? " dia" : " dias");
+    }
+
+    private String formatLongTime(long ms) {
+        long totalSeconds = Math.max(0L, ms / 1000L);
+        long hours = totalSeconds / 3600L;
+        long minutes = (totalSeconds % 3600L) / 60L;
+        long seconds = totalSeconds % 60L;
+        if (hours > 0) return String.format(Locale.getDefault(), "%dh %02dmin", hours, minutes);
+        if (minutes > 0) return String.format(Locale.getDefault(), "%dmin %02ds", minutes, seconds);
+        return seconds + "s";
     }
 
     private String time(long ms) {

@@ -16,6 +16,7 @@ public class Movie {
 
     public int playCount = 0;
     public boolean favorite = false;
+    public boolean watched = false;
 
     // Modos usados pelas versões novas do Cine Offline:
     // "zip"     = importado de ZIP e copiado para o app
@@ -44,6 +45,7 @@ public class Movie {
             o.put("lastPlayedAt", lastPlayedAt);
             o.put("playCount", playCount);
             o.put("favorite", favorite);
+            o.put("watched", watched);
             o.put("storageMode", storageMode);
             o.put("sourceUri", sourceUri);
         } catch (Exception ignored) {
@@ -71,6 +73,12 @@ public class Movie {
 
         m.playCount = o.optInt("playCount", 0);
         m.favorite = o.optBoolean("favorite", false);
+        // Compatibilidade: versões antigas não tinham o campo watched. Quando havia
+        // reprodução registrada, posição zerada e duração conhecida, o caso mais comum
+        // era um filme concluído até o fim.
+        m.watched = o.has("watched")
+                ? o.optBoolean("watched", false)
+                : (m.playCount > 0 && m.lastPlayedAt > 0 && m.durationMs > 0 && m.progressMs == 0);
 
         // Compatibilidade com filmes cadastrados antes do modo rápido.
         m.storageMode = o.optString("storageMode", "copied");

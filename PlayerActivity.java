@@ -2,11 +2,14 @@ package com.offlineplayer.cineoffline;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -25,6 +28,7 @@ import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.ui.PlayerView;
 
 import java.io.File;
+import java.util.List;
 
 public class PlayerActivity extends Activity {
     private ExoPlayer player;
@@ -36,6 +40,11 @@ public class PlayerActivity extends Activity {
     private TextView speedButton;
     private boolean started;
     private boolean fullscreen;
+    private final Handler nextHandler = new Handler(Looper.getMainLooper());
+    private boolean nextEpisodeScheduled;
+
+    private static final String PREF_SETTINGS = "cine_offline_settings";
+    private static final String KEY_AUTO_NEXT = "auto_next_episode";
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -180,9 +189,11 @@ public class PlayerActivity extends Activity {
                 }
                 if (playbackState == Player.STATE_ENDED) {
                     movie.progressMs = 0;
+                    movie.watched = true;
                     long d = player.getDuration();
                     if (d > 0) movie.durationMs = d;
                     repo.save(movie);
+                    scheduleNextEpisodeIfEnabled();
                 }
             }
 
@@ -202,6 +213,42 @@ public class PlayerActivity extends Activity {
             }
         });
         player.prepare();
+    }
+
+
+    private void scheduleNextEpisodeIfEnabled() {
+        if (nextEpisodeScheduled || movie == null) return;
+        boolean enabled = getSharedPreferences(PREF_SETTINGS, MODE_PRIVATE)
+                .getBoolean(KEY_AUTO_NEXT, false);
+        if (!enabled) return;
+
+        Movie next = findNextEpisode();
+        if (next == null) return;
+        nextEpisodeScheduled = true;
+        Toast.makeText(this, "⏭ Próximo episódio: " + next.title, Toast.LENGTH_SHORT).show();
+        nextHandler.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            Intent i = new Intent(PlayerActivity.this, PlayerActivity.class);
+            i.putExtra("movieId", next.id);
+            startActivity(i);
+            finish();
+        }, 1500);
+    }
+
+    private Movie findNextEpisode() {
+        try {
+            SeriesRepository seriesRepo = new SeriesRepository(this);
+            SeriesRepository.Assignment current = seriesRepo.getAssignment(movie.id);
+            if (current == null) return null;
+            List<SeriesRepository.Assignment> list = seriesRepo.getAssignmentsForSeries(current.seriesId);
+            for (int i = 0; i < list.size(); i++) {
+                SeriesRepository.Assignment a = list.get(i);
+                if (!movie.id.equals(a.movieId)) continue;
+                if (i + 1 >= list.size()) return null;
+                return repo.getById(list.get(i + 1).movieId);
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 
     private void seekBy(long amount) {
@@ -258,8 +305,12 @@ public class PlayerActivity extends Activity {
         long pos = Math.max(0, player.getCurrentPosition());
         long dur = player.getDuration();
         if (dur > 0) movie.durationMs = dur;
-        if (dur > 0 && pos >= dur - 20_000) movie.progressMs = 0;
-        else movie.progressMs = pos;
+        if (dur > 0 && pos >= dur - 20_000) {
+            movie.progressMs = 0;
+            movie.watched = true;
+        } else {
+            movie.progressMs = pos;
+        }
         movie.lastPlayedAt = System.currentTimeMillis();
         repo.save(movie);
     }
@@ -272,6 +323,7 @@ public class PlayerActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        nextHandler.removeCallbacksAndMessages(null);
         saveProgress();
         if (player != null) {
             playerView.setPlayer(null);

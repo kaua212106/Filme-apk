@@ -10,8 +10,8 @@ android {
         applicationId 'com.offlineplayer.cineoffline'
         minSdk 24
         targetSdk 35
-        versionCode 8
-        versionName '3.8.0'
+        versionCode 9
+        versionName '4.0.0'
     }
 
     sourceSets {
@@ -73,5 +73,4 @@ dependencies {
     implementation 'androidx.media3:media3-exoplayer:1.5.1'
     implementation 'androidx.media3:media3-exoplayer-hls:1.5.1'
     implementation 'androidx.media3:media3-ui:1.5.1'
-    implementation 'com.google.mlkit:text-recognition:16.0.1'
 }
