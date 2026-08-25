@@ -19,6 +19,9 @@ android {
             manifest.srcFile 'AndroidManifest.xml'
             java.srcDirs = ['.']
             java.exclude 'build/**'
+            // Arquivo antigo da identificação por OCR/ML Kit. Esse recurso foi removido
+            // do Cine Offline, então ele não deve mais participar da compilação.
+            java.exclude 'ContentTitleIdentifier.java'
             res.srcDirs = ["${buildDir}/generated/cineRes"]
         }
     }
