@@ -4,21 +4,25 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Toast;
 
 import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Captura somente os nomes que aparecem na tela de Downloads do app original.
- * O serviço é limitado ao pacote com.starshort.minishort no XML de acessibilidade.
+ * Captura filmes e também entra automaticamente nas temporadas agrupadas do app original
+ * para ler os episódios individuais. O serviço só recebe eventos de com.starshort.minishort.
  */
 public class OriginalTitleAccessibilityService extends AccessibilityService {
     static final String ORIGINAL_PACKAGE = "com.starshort.minishort";
@@ -26,24 +30,55 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
     private static final String KEY_ACTIVE = "active";
     private static final String KEY_FINISHED = "finished";
     private static final String KEY_TITLES = "titles";
+    private static final String KEY_RECORDS = "records_v2";
     private static final String KEY_SIGNATURES = "signatures";
     private static final String KEY_LAST_ACTIVITY = "last_activity";
+    private static final String KEY_SESSION = "session";
+
+    private static final Pattern SIZE_PATTERN = Pattern.compile(
+            "(?i)(\\d{1,4}(?:[.,]\\d{1,3})?)\\s*(KB|MB|GB|TB)\\b");
+    private static final Pattern SEASON_CONTAINER = Pattern.compile(
+            "(?iu).*\\btemporada\\s*\\d{1,3}\\s*$");
+    private static final Pattern EPISODE_STYLE = Pattern.compile(
+            "(?iu).*\\btemporada\\s*\\d{1,3}\\s+(?:epis[oó]dio\\s*)?\\d{1,4}\\s*$");
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final ArrayList<String> titles = new ArrayList<>();
+    private final ArrayList<CapturedItem> records = new ArrayList<>();
     private final Set<String> signatures = new HashSet<>();
+    private final Set<String> visitedGroups = new HashSet<>();
+
     private boolean scheduled = false;
-    private int idlePasses = 0;
+    private int mainIdlePasses = 0;
+    private int detailIdlePasses = 0;
     private int waitingPasses = 0;
     private String lastActivity = "";
+    private String activeGroupTitle = null;
+    private long groupClickedAt = 0L;
+    private long loadedSession = -1L;
+
+    static final class CapturedItem {
+        final String title;
+        final long sizeBytes;
+        final String sizeText;
+        final String groupTitle;
+
+        CapturedItem(String title, long sizeBytes, String sizeText, String groupTitle) {
+            this.title = title == null ? "" : title;
+            this.sizeBytes = Math.max(0L, sizeBytes);
+            this.sizeText = sizeText == null ? "" : sizeText;
+            this.groupTitle = groupTitle == null ? "" : groupTitle;
+        }
+    }
 
     static void beginCapture(android.content.Context context) {
         context.getSharedPreferences(PREF, MODE_PRIVATE).edit()
                 .putBoolean(KEY_ACTIVE, true)
                 .putBoolean(KEY_FINISHED, false)
                 .putString(KEY_TITLES, "[]")
+                .putString(KEY_RECORDS, "[]")
                 .putString(KEY_SIGNATURES, "[]")
                 .putString(KEY_LAST_ACTIVITY, "")
+                .putLong(KEY_SESSION, System.currentTimeMillis())
                 .apply();
     }
 
@@ -60,17 +95,45 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
     }
 
     static int capturedCount(android.content.Context context) {
+        List<CapturedItem> items = getCapturedItems(context);
+        if (!items.isEmpty()) return items.size();
         return getCapturedTitles(context).size();
     }
 
     static List<String> getCapturedTitles(android.content.Context context) {
         ArrayList<String> out = new ArrayList<>();
+        List<CapturedItem> items = getCapturedItems(context);
+        if (!items.isEmpty()) {
+            for (CapturedItem item : items) if (!item.title.isEmpty()) out.add(item.title);
+            return out;
+        }
         String raw = context.getSharedPreferences(PREF, MODE_PRIVATE).getString(KEY_TITLES, "[]");
         try {
             JSONArray arr = new JSONArray(raw == null ? "[]" : raw);
             for (int i = 0; i < arr.length(); i++) {
                 String s = arr.optString(i, "").trim();
                 if (!s.isEmpty()) out.add(s);
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
+    static List<CapturedItem> getCapturedItems(android.content.Context context) {
+        ArrayList<CapturedItem> out = new ArrayList<>();
+        String raw = context.getSharedPreferences(PREF, MODE_PRIVATE).getString(KEY_RECORDS, "[]");
+        try {
+            JSONArray arr = new JSONArray(raw == null ? "[]" : raw);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                String title = o.optString("title", "").trim();
+                if (title.isEmpty()) continue;
+                out.add(new CapturedItem(
+                        title,
+                        o.optLong("sizeBytes", 0L),
+                        o.optString("sizeText", ""),
+                        o.optString("groupTitle", "")
+                ));
             }
         } catch (Exception ignored) {}
         return out;
@@ -85,7 +148,7 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
                 | AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
                 | AccessibilityEvent.TYPE_VIEW_SCROLLED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
-        info.notificationTimeout = 120;
+        info.notificationTimeout = 100;
         info.packageNames = new String[]{ORIGINAL_PACKAGE};
         info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
         setServiceInfo(info);
@@ -104,15 +167,10 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         }
 
         if (!isCaptureActive(this)) return;
-        // A captura só é iniciada manualmente pelo usuário e o serviço é limitado ao pacote
-        // do app original, então não dependemos do nome da Activity conter “download”.
-        scheduleScan(240);
+        scheduleScan(220);
     }
 
-    @Override
-    public void onInterrupt() {
-        // Nada a limpar: a captura pode continuar quando o serviço voltar.
-    }
+    @Override public void onInterrupt() {}
 
     @Override
     public void onDestroy() {
@@ -120,60 +178,193 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         super.onDestroy();
     }
 
-    private boolean looksLikeDownloadScreen(String className) {
-        String s = className == null ? "" : className.toLowerCase(Locale.ROOT);
-        return s.contains("download");
-    }
-
     private void scheduleScan(long delay) {
         if (scheduled) return;
         scheduled = true;
         handler.postDelayed(() -> {
             scheduled = false;
-            scanAndScroll();
+            scanState();
         }, delay);
     }
 
-    private void scanAndScroll() {
+    private void scanState() {
         if (!isCaptureActive(this)) return;
+        long session = getSharedPreferences(PREF, MODE_PRIVATE).getLong(KEY_SESSION, 0L);
+        if (session != loadedSession) resetForNewSession(session);
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) {
-            scheduleScan(650);
+            scheduleScan(600);
             return;
         }
 
+        if (activeGroupTitle != null) {
+            // Dá tempo para a tela da temporada realmente abrir antes de tratá-la como detalhe.
+            long elapsed = SystemClock.uptimeMillis() - groupClickedAt;
+            if (elapsed < 750) {
+                scheduleScan(800 - elapsed);
+                return;
+            }
+            scanSeriesDetail(root);
+        } else {
+            scanMainDownloads(root);
+        }
+    }
+
+    private void scanMainDownloads(AccessibilityNodeInfo root) {
         AccessibilityNodeInfo list = findBestList(root);
         if (list == null) {
             waitingPasses++;
-            if (waitingPasses < 45) scheduleScan(650);
+            if (waitingPasses < 60) scheduleScan(500);
             return;
         }
         waitingPasses = 0;
 
-        int before = titles.size();
-        captureVisibleRows(list);
-        int after = titles.size();
-        if (after > before) {
-            idlePasses = 0;
-            persistState(false);
-        } else {
-            idlePasses++;
+        int before = records.size();
+        AccessibilityNodeInfo groupToOpen = null;
+        String groupTitle = null;
+
+        for (int i = 0; i < list.getChildCount(); i++) {
+            AccessibilityNodeInfo row = list.getChild(i);
+            if (row == null || !row.isVisibleToUser()) continue;
+            RowInfo info = rowInfo(row);
+            if (info == null) continue;
+
+            if (isSeriesContainer(info.title)) {
+                String key = normalizeGroupKey(info.title);
+                if (!visitedGroups.contains(key) && groupToOpen == null) {
+                    groupToOpen = row;
+                    groupTitle = info.title;
+                }
+                // O cartão da temporada representa vários episódios; não o salvamos como filme.
+                continue;
+            }
+            addRecord(info, "");
         }
 
-        if (titles.size() >= 250) {
+        if (records.size() > before) {
+            mainIdlePasses = 0;
+            persistState(false);
+        } else {
+            mainIdlePasses++;
+        }
+
+        // Antes de rolar, entra na primeira temporada visível ainda não analisada.
+        if (groupToOpen != null && groupTitle != null) {
+            if (clickRow(groupToOpen)) {
+                activeGroupTitle = groupTitle;
+                groupClickedAt = SystemClock.uptimeMillis();
+                detailIdlePasses = 0;
+                persistState(false);
+                scheduleScan(850);
+                return;
+            } else {
+                // Evita ficar preso eternamente num cartão que o Android não permite clicar.
+                visitedGroups.add(normalizeGroupKey(groupTitle));
+            }
+        }
+
+        if (records.size() >= 400) {
             finishCapture();
             return;
         }
 
-        boolean moved = false;
-        try { moved = list.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD); }
-        catch (Exception ignored) {}
-
-        if ((!moved && after > 0) || (idlePasses >= 4 && after > 0)) {
+        boolean moved = safeScrollForward(list);
+        if ((!moved && !records.isEmpty()) || (mainIdlePasses >= 5 && !records.isEmpty())) {
             finishCapture();
         } else {
-            scheduleScan(moved ? 650 : 850);
+            scheduleScan(moved ? 520 : 750);
         }
+    }
+
+    private void scanSeriesDetail(AccessibilityNodeInfo root) {
+        AccessibilityNodeInfo list = findBestList(root);
+        if (list == null) {
+            waitingPasses++;
+            if (waitingPasses < 18) {
+                scheduleScan(450);
+                return;
+            }
+            leaveSeriesDetail();
+            return;
+        }
+        waitingPasses = 0;
+
+        int before = records.size();
+        for (int i = 0; i < list.getChildCount(); i++) {
+            AccessibilityNodeInfo row = list.getChild(i);
+            if (row == null || !row.isVisibleToUser()) continue;
+            RowInfo info = rowInfo(row);
+            if (info == null) continue;
+
+            // Dentro da temporada cada cartão é um download individual. Exigimos tamanho,
+            // porque ele será usado depois para associar o episódio à pasta hexadecimal correta.
+            if (info.sizeBytes > 0 && !looksLikeHeaderOnly(info.title)) {
+                addRecord(info, activeGroupTitle);
+            }
+        }
+
+        if (records.size() > before) {
+            detailIdlePasses = 0;
+            persistState(false);
+        } else {
+            detailIdlePasses++;
+        }
+
+        boolean moved = safeScrollForward(list);
+        if ((!moved && detailIdlePasses >= 1) || detailIdlePasses >= 4) {
+            leaveSeriesDetail();
+        } else {
+            scheduleScan(moved ? 500 : 700);
+        }
+    }
+
+    private void leaveSeriesDetail() {
+        if (activeGroupTitle != null) visitedGroups.add(normalizeGroupKey(activeGroupTitle));
+        activeGroupTitle = null;
+        detailIdlePasses = 0;
+        waitingPasses = 0;
+        performGlobalAction(GLOBAL_ACTION_BACK);
+        persistState(false);
+        scheduleScan(950);
+    }
+
+    private boolean safeScrollForward(AccessibilityNodeInfo list) {
+        try { return list.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD); }
+        catch (Exception ignored) { return false; }
+    }
+
+    private boolean clickRow(AccessibilityNodeInfo row) {
+        if (row == null) return false;
+        try {
+            if (row.isClickable() && row.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+        } catch (Exception ignored) {}
+
+        AccessibilityNodeInfo clickable = findClickableDescendant(row, 0);
+        if (clickable != null) {
+            try { if (clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true; }
+            catch (Exception ignored) {}
+        }
+
+        AccessibilityNodeInfo p = row.getParent();
+        int hops = 0;
+        while (p != null && hops++ < 4) {
+            try { if (p.isClickable() && p.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true; }
+            catch (Exception ignored) {}
+            p = p.getParent();
+        }
+        return false;
+    }
+
+    private AccessibilityNodeInfo findClickableDescendant(AccessibilityNodeInfo node, int depth) {
+        if (node == null || depth > 6) return null;
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo c = node.getChild(i);
+            if (c == null) continue;
+            if (c.isVisibleToUser() && c.isClickable()) return c;
+            AccessibilityNodeInfo nested = findClickableDescendant(c, depth + 1);
+            if (nested != null) return nested;
+        }
+        return null;
     }
 
     private AccessibilityNodeInfo findBestList(AccessibilityNodeInfo root) {
@@ -182,27 +373,29 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         AccessibilityNodeInfo best = null;
         int bestScore = -1;
         for (AccessibilityNodeInfo n : candidates) {
+            if (n == null || !n.isVisibleToUser()) continue;
             int score = 0;
             int childCount = n.getChildCount();
-            if (!n.isVisibleToUser()) continue;
             for (int i = 0; i < childCount; i++) {
                 AccessibilityNodeInfo child = n.getChild(i);
                 if (child == null || !child.isVisibleToUser()) continue;
-                List<String> texts = new ArrayList<>();
-                collectTexts(child, texts, 0);
-                if (chooseTitle(texts) != null) score += 10;
+                RowInfo ri = rowInfo(child);
+                if (ri != null) {
+                    score += 12;
+                    if (ri.sizeBytes > 0) score += 10;
+                }
             }
-            score += Math.min(childCount, 12);
+            score += Math.min(childCount, 15);
             if (score > bestScore) {
                 bestScore = score;
                 best = n;
             }
         }
-        return bestScore >= 10 ? best : null;
+        return bestScore >= 12 ? best : null;
     }
 
     private void collectLists(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> out, int depth) {
-        if (node == null || depth > 12) return;
+        if (node == null || depth > 13) return;
         CharSequence cls = node.getClassName();
         String c = cls == null ? "" : cls.toString();
         if (c.contains("RecyclerView") || c.contains("ListView") || node.isScrollable()) out.add(node);
@@ -212,18 +405,15 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         }
     }
 
-    private void captureVisibleRows(AccessibilityNodeInfo list) {
-        for (int i = 0; i < list.getChildCount(); i++) {
-            AccessibilityNodeInfo row = list.getChild(i);
-            if (row == null || !row.isVisibleToUser()) continue;
-            ArrayList<String> texts = new ArrayList<>();
-            collectTexts(row, texts, 0);
-            String title = chooseTitle(texts);
-            if (title == null) continue;
-            String signature = buildSignature(texts);
-            if (signature.isEmpty()) signature = title;
-            if (signatures.add(signature)) titles.add(title);
-        }
+    private RowInfo rowInfo(AccessibilityNodeInfo row) {
+        ArrayList<String> texts = new ArrayList<>();
+        collectTexts(row, texts, 0);
+        if (texts.isEmpty()) return null;
+        String title = chooseTitle(texts);
+        if (title == null || title.trim().isEmpty()) return null;
+        String sizeText = findSizeText(texts);
+        long sizeBytes = parseSizeBytes(sizeText);
+        return new RowInfo(title.trim(), sizeText, sizeBytes);
     }
 
     private void collectTexts(AccessibilityNodeInfo node, List<String> out, int depth) {
@@ -256,9 +446,11 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
                 if (Character.isLetter(ch)) letters++;
                 if (Character.isWhitespace(ch)) spaces++;
             }
-            int score = Math.min(s.length(), 90) + letters * 2 + Math.min(spaces, 8) * 3;
+            int score = Math.min(s.length(), 100) + letters * 3 + Math.min(spaces, 10) * 3;
             String lower = s.toLowerCase(Locale.ROOT);
-            if (lower.matches(".*(?:s\\d{1,2}e\\d{1,3}|temporada|epis[oó]dio|episode|season).*")) score += 35;
+            if (lower.contains("temporada")) score += 45;
+            if (EPISODE_STYLE.matcher(s).matches()) score += 55;
+            if (SIZE_PATTERN.matcher(s).find()) score -= 100;
             if (score > bestScore) {
                 bestScore = score;
                 best = s;
@@ -273,43 +465,88 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         if (s.length() < 2 || s.length() > 180) return false;
         String lower = s.toLowerCase(Locale.ROOT);
         if (lower.startsWith("http://") || lower.startsWith("https://")) return false;
+        if (SIZE_PATTERN.matcher(s).matches()) return false;
         if (lower.matches("^[0-9\\s:.,%+\\-/]+$")) return false;
-        if (lower.matches(".*\\b(?:kb|mb|gb|tb)(?:/s)?\\b.*") && !hasManyLetters(s)) return false;
-        if (lower.matches("^\\d+(?:[.,]\\d+)?\\s*(?:kb|mb|gb|tb)(?:/s)?$")) return false;
         if (lower.matches("^\\d{1,3}%$")) return false;
         if (lower.matches("^\\d{1,2}:\\d{2}(?::\\d{2})?$")) return false;
-
+        if (lower.matches("^\\d+\\s*epis[oó]dios?$")) return false;
         String compact = lower.replaceAll("[.!…:]+$", "").trim();
         String[] ignored = {
-                "download", "downloads", "baixar", "baixando", "baixados", "baixado",
+                "download", "downloads", "meu download", "baixar", "baixando", "baixados", "baixado",
                 "concluído", "concluidos", "concluídos", "completed", "downloading",
                 "pausar", "pause", "continuar", "resume", "excluir", "delete", "editar", "edit",
                 "assistir", "play", "reproduzir", "cancelar", "cancel", "tentar novamente", "retry",
                 "sem downloads", "nenhum download", "no downloads", "voltar", "back"
         };
         for (String x : ignored) if (compact.equals(x)) return false;
-        return hasManyLetters(s);
-    }
-
-    private boolean hasManyLetters(String s) {
         int letters = 0;
         for (int i = 0; i < s.length(); i++) if (Character.isLetter(s.charAt(i))) letters++;
         return letters >= 2;
     }
 
-    private String buildSignature(List<String> texts) {
-        StringBuilder sb = new StringBuilder();
+    private String findSizeText(List<String> texts) {
         for (String s : texts) {
-            if (sb.length() > 0) sb.append(" | ");
-            sb.append(s);
+            Matcher m = SIZE_PATTERN.matcher(s);
+            if (m.find()) return m.group(0).replace(" ", "");
         }
-        String v = sb.toString();
-        return v.length() > 500 ? v.substring(0, 500) : v;
+        return "";
+    }
+
+    private long parseSizeBytes(String text) {
+        if (text == null || text.isEmpty()) return 0L;
+        Matcher m = SIZE_PATTERN.matcher(text);
+        if (!m.find()) return 0L;
+        try {
+            double n = Double.parseDouble(m.group(1).replace(',', '.'));
+            String unit = m.group(2).toUpperCase(Locale.ROOT);
+            double mul = 1d;
+            if ("KB".equals(unit)) mul = 1_000d;
+            else if ("MB".equals(unit)) mul = 1_000_000d;
+            else if ("GB".equals(unit)) mul = 1_000_000_000d;
+            else if ("TB".equals(unit)) mul = 1_000_000_000_000d;
+            return Math.round(n * mul);
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    private boolean isSeriesContainer(String title) {
+        return title != null && SEASON_CONTAINER.matcher(title.trim()).matches()
+                && !EPISODE_STYLE.matcher(title.trim()).matches();
+    }
+
+    private boolean looksLikeHeaderOnly(String title) {
+        if (title == null) return true;
+        String t = title.trim();
+        if (t.isEmpty()) return true;
+        return activeGroupTitle != null && normalizeGroupKey(t).equals(normalizeGroupKey(activeGroupTitle));
+    }
+
+    private String normalizeGroupKey(String s) {
+        return s == null ? "" : s.replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
+    }
+
+    private void addRecord(RowInfo info, String groupTitle) {
+        if (info == null || info.title == null || info.title.trim().isEmpty()) return;
+        String signature = normalizeGroupKey(info.title) + "|" + info.sizeBytes;
+        if (!signatures.add(signature)) return;
+        records.add(new CapturedItem(info.title.trim(), info.sizeBytes, info.sizeText, groupTitle));
+    }
+
+    private void resetForNewSession(long session) {
+        records.clear();
+        signatures.clear();
+        visitedGroups.clear();
+        activeGroupTitle = null;
+        mainIdlePasses = 0;
+        detailIdlePasses = 0;
+        waitingPasses = 0;
+        loadedSession = session;
     }
 
     private void loadState() {
-        titles.clear();
-        titles.addAll(getCapturedTitles(this));
+        records.clear();
+        records.addAll(getCapturedItems(this));
         signatures.clear();
         String raw = getSharedPreferences(PREF, MODE_PRIVATE).getString(KEY_SIGNATURES, "[]");
         try {
@@ -320,15 +557,28 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
             }
         } catch (Exception ignored) {}
         lastActivity = getSharedPreferences(PREF, MODE_PRIVATE).getString(KEY_LAST_ACTIVITY, "");
+        loadedSession = getSharedPreferences(PREF, MODE_PRIVATE).getLong(KEY_SESSION, 0L);
     }
 
     private void persistState(boolean finished) {
+        JSONArray ra = new JSONArray();
         JSONArray ta = new JSONArray();
-        for (String s : titles) ta.put(s);
+        for (CapturedItem item : records) {
+            ta.put(item.title);
+            JSONObject o = new JSONObject();
+            try {
+                o.put("title", item.title);
+                o.put("sizeBytes", item.sizeBytes);
+                o.put("sizeText", item.sizeText);
+                o.put("groupTitle", item.groupTitle);
+                ra.put(o);
+            } catch (Exception ignored) {}
+        }
         JSONArray sa = new JSONArray();
         for (String s : signatures) sa.put(s);
         getSharedPreferences(PREF, MODE_PRIVATE).edit()
                 .putString(KEY_TITLES, ta.toString())
+                .putString(KEY_RECORDS, ra.toString())
                 .putString(KEY_SIGNATURES, sa.toString())
                 .putBoolean(KEY_FINISHED, finished)
                 .putBoolean(KEY_ACTIVE, !finished)
@@ -338,9 +588,20 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
     private void finishCapture() {
         persistState(true);
         Toast.makeText(this,
-                titles.isEmpty()
-                        ? "Não encontrei nomes na tela de downloads."
-                        : "✅ Captura concluída: " + titles.size() + " nomes. Volte ao Cine Offline.",
+                records.isEmpty()
+                        ? "Não encontrei downloads individuais."
+                        : "✅ Captura concluída: " + records.size() + " item(ns). Volte ao Cine Offline.",
                 Toast.LENGTH_LONG).show();
+    }
+
+    private static final class RowInfo {
+        final String title;
+        final String sizeText;
+        final long sizeBytes;
+        RowInfo(String title, String sizeText, long sizeBytes) {
+            this.title = title;
+            this.sizeText = sizeText;
+            this.sizeBytes = sizeBytes;
+        }
     }
 }

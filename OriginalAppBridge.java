@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.provider.Settings;
+import android.provider.DocumentsContract;
 import android.view.accessibility.AccessibilityManager;
 
 import org.json.JSONArray;
@@ -178,92 +179,102 @@ public final class OriginalAppBridge {
     public static IdentificationResult applySavedMappings(Context context, MovieRepository repo) {
         Map<String, String> byResource = getSavedMappings(context);
         if (byResource.isEmpty()) return IdentificationResult.fail("Nenhuma associação de nome foi salva ainda.");
-        return applyMappingsToLibrary(repo, byResource, 0, 0,
+        IdentificationResult result = applyMappingsToLibrary(context, repo, byResource, 0, 0,
                 "Os nomes vieram da configuração salva no próprio Cine Offline.");
+        autoOrganizeRecognizedSeries(context, repo);
+        return result;
     }
 
     public static IdentificationResult identifyAndRename(Context context, MovieRepository repo,
                                                          ProgressListener listener) {
-        // A captura de acessibilidade continua existindo como fallback para filmes antigos.
-        // Para séries, porém, a tela principal mostra apenas a temporada agrupada. O servidor
-        // local do app original expõe cada download individual com streamid/complete_name,
-        // então usamos esses dados primeiro para não perder os episódios que ficam "dentro"
-        // da temporada.
-        List<String> capturedTitles = getCapturedTitles(context);
-
-        listener.onProgress("🔎 Lendo filmes e episódios do app original…");
-        List<DownloadEntry> entries;
-        try {
-            entries = fetchDownloadEntries(context, listener);
-        } catch (Exception e) {
-            return IdentificationResult.fail(e.getMessage() == null ? e.toString() : e.getMessage());
+        List<OriginalTitleAccessibilityService.CapturedItem> captured =
+                OriginalTitleAccessibilityService.getCapturedItems(context.getApplicationContext());
+        if (captured.isEmpty()) {
+            return IdentificationResult.fail("Nenhum filme ou episódio individual foi capturado ainda. Faça uma nova captura começando em Downloads > Baixado.");
         }
-        if (entries.isEmpty()) return IdentificationResult.fail("O app original não retornou downloads.");
 
-        List<DownloadEntry> completed = new ArrayList<>();
-        boolean hasPercent = false;
-        for (DownloadEntry e : entries) if (e.percentKnown) hasPercent = true;
-        for (DownloadEntry e : entries) {
-            if (!hasPercent || e.percent >= 100) completed.add(e);
+        listener.onProgress("🔎 Associando títulos pelo tamanho de cada download…");
+
+        List<Movie> movies = repo.getAll();
+        if (movies.isEmpty()) return IdentificationResult.fail("A biblioteca do Cine Offline está vazia.");
+
+        ArrayList<LocalMovieInfo> locals = new ArrayList<>();
+        for (Movie movie : movies) {
+            String resource = extractResourceId(movie);
+            if (resource.isEmpty()) continue;
+            long size = readOriginalDownloadSize(context, movie, resource);
+            locals.add(new LocalMovieInfo(movie, resource, size));
         }
-        Collections.sort(completed, Comparator.comparing(a -> a.downloadTime == null ? "" : a.downloadTime));
-        if (completed.isEmpty()) return IdentificationResult.fail("Não encontrei downloads concluídos no app original.");
+
+        if (locals.isEmpty()) {
+            return IdentificationResult.fail("Os filmes atuais não guardam o código da pasta. Importe novamente a pasta Filmes no modo rápido e tente de novo.");
+        }
 
         Map<String, String> byResource = new HashMap<>();
-        int directNames = 0;
+        Set<String> usedResources = new HashSet<>();
+        int withReadableSize = 0;
+        int matchedBySize = 0;
 
-        // Primeiro método: associação exata do próprio app original. Cada episódio possui seu
-        // próprio streamid, mesmo quando a interface mostra a temporada como um único cartão.
-        for (DownloadEntry e : completed) {
-            String resource = normalizeResource(e.resource);
-            String title = cleanCapturedTitle(e.completeName);
-            if (resource.isEmpty() || title.isEmpty()) continue;
-            byResource.put(resource, title);
-            directNames++;
-        }
+        for (OriginalTitleAccessibilityService.CapturedItem item : captured) {
+            if (item == null || item.title == null || item.title.trim().isEmpty() || item.sizeBytes <= 0) continue;
+            withReadableSize++;
+            long binarySize = parseDisplayedSizeBinary(item.sizeText);
 
-        // Fallback antigo: só usa a ordem da tela quando a quantidade bate EXATAMENTE com os
-        // itens ainda sem nome. Isso evita atribuir o nome de uma temporada a um episódio errado.
-        if (byResource.size() < completed.size() && !capturedTitles.isEmpty()) {
-            List<DownloadEntry> missing = new ArrayList<>();
-            for (DownloadEntry e : completed) {
-                String resource = normalizeResource(e.resource);
-                if (!resource.isEmpty() && !byResource.containsKey(resource)) missing.add(e);
-            }
+            LocalMovieInfo best = null;
+            LocalMovieInfo second = null;
+            long bestDiff = Long.MAX_VALUE;
+            long secondDiff = Long.MAX_VALUE;
 
-            if (capturedTitles.size() == missing.size()) {
-                for (int i = 0; i < missing.size(); i++) {
-                    String resource = normalizeResource(missing.get(i).resource);
-                    String title = cleanCapturedTitle(capturedTitles.get(i));
-                    if (!resource.isEmpty() && !title.isEmpty()) byResource.put(resource, title);
-                }
-            } else if (directNames == 0 && capturedTitles.size() == completed.size()) {
-                for (int i = 0; i < completed.size(); i++) {
-                    String resource = normalizeResource(completed.get(i).resource);
-                    String title = cleanCapturedTitle(capturedTitles.get(i));
-                    if (!resource.isEmpty() && !title.isEmpty()) byResource.put(resource, title);
+            for (LocalMovieInfo local : locals) {
+                if (local.sizeBytes <= 0 || usedResources.contains(local.resource)) continue;
+                long diffDecimal = Math.abs(local.sizeBytes - item.sizeBytes);
+                long diffBinary = binarySize > 0 ? Math.abs(local.sizeBytes - binarySize) : Long.MAX_VALUE;
+                long diff = Math.min(diffDecimal, diffBinary);
+                if (diff < bestDiff) {
+                    second = best;
+                    secondDiff = bestDiff;
+                    best = local;
+                    bestDiff = diff;
+                } else if (diff < secondDiff) {
+                    second = local;
+                    secondDiff = diff;
                 }
             }
+
+            if (best == null) continue;
+            long referenceSize = binarySize > 0 ? Math.max(item.sizeBytes, binarySize) : item.sizeBytes;
+            long tolerance = Math.max(3_000_000L, Math.round(referenceSize * 0.018));
+            if (bestDiff > tolerance) continue;
+
+            // Se dois arquivos têm praticamente o mesmo tamanho, não adivinha.
+            if (second != null && secondDiff <= tolerance) {
+                long separation = secondDiff - bestDiff;
+                if (separation < Math.max(700_000L, tolerance / 4)) continue;
+            }
+
+            String title = cleanCapturedTitle(item.title);
+            if (title.isEmpty()) continue;
+            byResource.put(best.resource, title);
+            usedResources.add(best.resource);
+            matchedBySize++;
         }
 
         if (byResource.isEmpty()) {
             return IdentificationResult.fail(
-                    "O app original foi encontrado, mas não devolveu nomes individuais para os downloads. "
-                            + "Deixe-o aberto em Downloads > Baixado e tente novamente. Nenhum nome foi alterado.");
+                    "Consegui ler " + captured.size() + " item(ns) na tela, mas não consegui ligar nenhum deles às pastas locais com segurança. "
+                            + "Faça a captura novamente sem apagar os downloads do app original.");
         }
 
         saveMappings(context, byResource);
-        listener.onProgress("💾 Salvando filmes e episódios no Cine Offline…");
-
-        String warning = directNames > 0
-                ? "Os episódios agrupados por temporada foram lidos individualmente pelo registro de downloads do app original. "
-                    + "As associações código → nome ficaram salvas no celular e também entram no backup da organização."
-                : "Os nomes vieram da captura visual. As associações código → nome ficaram salvas no celular e entram no backup da organização.";
-
-        return applyMappingsToLibrary(repo, byResource, capturedTitles.size(), completed.size(), warning);
+        listener.onProgress("💾 Salvando filmes e episódios reconhecidos…");
+        IdentificationResult result = applyMappingsToLibrary(context, repo, byResource,
+                captured.size(), matchedBySize,
+                "As temporadas agrupadas foram abertas automaticamente e os episódios foram associados pelo tamanho do download, sem depender da ordem da lista. As associações ficam no backup.");
+        autoOrganizeRecognizedSeries(context, repo);
+        return result;
     }
 
-    private static IdentificationResult applyMappingsToLibrary(MovieRepository repo, Map<String, String> byResource,
+    private static IdentificationResult applyMappingsToLibrary(Context context, MovieRepository repo, Map<String, String> byResource,
                                                                  int capturedTitles, int completedDownloads,
                                                                  String warning) {
         List<Movie> movies = repo.getAll();
@@ -300,6 +311,103 @@ public final class OriginalAppBridge {
 
         return new IdentificationResult(true, renamed, unchanged, movies.size(), foundIds,
                 capturedTitles, completedDownloads, notMatched, warning, null);
+    }
+
+    private static long readOriginalDownloadSize(Context context, Movie movie, String resource) {
+        if (context == null || movie == null || resource == null || resource.isEmpty()) return 0L;
+        String source = movie.sourceUri == null ? "" : movie.sourceUri.trim();
+        if (source.isEmpty()) return 0L;
+
+        try {
+            Uri tree = Uri.parse(source);
+            String treeDocId = DocumentsContract.getTreeDocumentId(tree);
+            if (treeDocId == null || treeDocId.isEmpty()) return 0L;
+
+            String folderDocId = treeDocId;
+            String decoded = Uri.decode(treeDocId);
+            if (!decoded.toUpperCase(Locale.ROOT).endsWith(resource.toUpperCase(Locale.ROOT))) {
+                folderDocId = treeDocId + "/" + resource;
+            }
+
+            Uri playlistUri = DocumentsContract.buildDocumentUriUsingTree(tree, folderDocId + "/index.m3u8");
+            try (InputStream in = context.getContentResolver().openInputStream(playlistUri)) {
+                if (in == null) return 0L;
+                BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+                String line;
+                long total = 0L;
+                Pattern p = Pattern.compile("(?:[?&])sz=(\\d+)", Pattern.CASE_INSENSITIVE);
+                while ((line = br.readLine()) != null) {
+                    Matcher m = p.matcher(line);
+                    if (m.find()) {
+                        try { total += Long.parseLong(m.group(1)); } catch (Exception ignored) {}
+                    }
+                }
+                return total;
+            }
+        } catch (Exception ignored) {
+            return 0L;
+        }
+    }
+
+
+    private static long parseDisplayedSizeBinary(String text) {
+        if (text == null) return 0L;
+        Matcher m = Pattern.compile("(?i)(\\d{1,4}(?:[.,]\\d{1,3})?)\\s*(KB|MB|GB|TB)").matcher(text);
+        if (!m.find()) return 0L;
+        try {
+            double n = Double.parseDouble(m.group(1).replace(',', '.'));
+            String u = m.group(2).toUpperCase(Locale.ROOT);
+            double mul = 1d;
+            if ("KB".equals(u)) mul = 1024d;
+            else if ("MB".equals(u)) mul = 1024d * 1024d;
+            else if ("GB".equals(u)) mul = 1024d * 1024d * 1024d;
+            else if ("TB".equals(u)) mul = 1024d * 1024d * 1024d * 1024d;
+            return Math.round(n * mul);
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+    private static void autoOrganizeRecognizedSeries(Context context, MovieRepository repo) {
+        if (context == null || repo == null) return;
+        Pattern p = Pattern.compile("(?iu)^(.+?)\\s*[–—-]\\s*Temporada\\s*(\\d{1,3})\\s+(?:Epis[oó]dio\\s*)?(\\d{1,4})\\s*$");
+        SeriesRepository seriesRepo = new SeriesRepository(context);
+        Map<String, SeriesRepository.SeriesInfo> existing = new HashMap<>();
+        for (SeriesRepository.SeriesInfo s : seriesRepo.getAllSeries()) {
+            existing.put(s.name.trim().toLowerCase(Locale.ROOT), s);
+        }
+
+        for (Movie movie : repo.getAll()) {
+            String title = movie.title == null ? "" : movie.title.trim();
+            Matcher m = p.matcher(title);
+            if (!m.matches()) continue;
+            String seriesName = m.group(1).trim();
+            int season;
+            int episode;
+            try {
+                season = Integer.parseInt(m.group(2));
+                episode = Integer.parseInt(m.group(3));
+            } catch (Exception e) {
+                continue;
+            }
+            String key = seriesName.toLowerCase(Locale.ROOT);
+            SeriesRepository.SeriesInfo info = existing.get(key);
+            if (info == null) {
+                info = seriesRepo.createSeries(seriesName);
+                existing.put(key, info);
+            }
+            seriesRepo.assign(movie.id, info.id, season, episode);
+        }
+    }
+
+    private static final class LocalMovieInfo {
+        final Movie movie;
+        final String resource;
+        final long sizeBytes;
+        LocalMovieInfo(Movie movie, String resource, long sizeBytes) {
+            this.movie = movie;
+            this.resource = resource;
+            this.sizeBytes = sizeBytes;
+        }
     }
 
     private static String cleanCapturedTitle(String s) {
@@ -464,10 +572,7 @@ public final class OriginalAppBridge {
     private static boolean looksLikeDownloadInfo(String body) {
         if (body == null) return false;
         String s = body.toLowerCase(Locale.ROOT);
-        boolean hasId = s.contains("resource") || s.contains("streamid") || s.contains("stream_id");
-        boolean hasDownloadData = s.contains("download_time") || s.contains("download_percent")
-                || s.contains("complete_name") || s.contains("download_size");
-        return hasId && hasDownloadData;
+        return s.contains("resource") && (s.contains("download_time") || s.contains("download_percent"));
     }
 
     private static List<DownloadEntry> parseEntries(String body) {
@@ -483,37 +588,11 @@ public final class OriginalAppBridge {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.optJSONObject(i);
                 if (o == null) continue;
-
+                String resource = o.optString("resource", "");
+                if (resource.isEmpty()) continue;
                 DownloadEntry e = new DownloadEntry();
-                e.resource = firstNonBlank(
-                        o.optString("resource", ""),
-                        o.optString("streamid", ""),
-                        o.optString("streamId", ""),
-                        o.optString("stream_id", "")
-                );
-                if (normalizeResource(e.resource).isEmpty()) continue;
-
-                e.completeName = firstNonBlank(
-                        o.optString("complete_name", ""),
-                        o.optString("completeName", ""),
-                        o.optString("name", ""),
-                        o.optString("title", "")
-                );
-                e.downloadTime = firstNonBlank(
-                        o.optString("download_time", ""),
-                        o.optString("downloadTime", ""),
-                        o.optString("updateTime", "")
-                );
-                e.videoType = firstNonBlank(
-                        o.optString("videoType", ""),
-                        o.optString("video_type", "")
-                );
-                e.episodeNum = firstNonBlank(
-                        o.optString("episodeNum", ""),
-                        o.optString("episode_num", ""),
-                        o.optString("episode", "")
-                );
-
+                e.resource = resource;
+                e.downloadTime = o.optString("download_time", o.optString("downloadTime", ""));
                 if (o.has("download_percent")) {
                     e.percentKnown = true;
                     e.percent = o.optInt("download_percent", 0);
@@ -521,41 +600,17 @@ public final class OriginalAppBridge {
                     e.percentKnown = true;
                     e.percent = o.optInt("downloadPercent", 0);
                 }
-
-                e.downloadSize = firstPositiveLong(
-                        o.optLong("download_size", 0),
-                        o.optLong("downloadSize", 0),
-                        o.optLong("file_size", 0),
-                        o.optLong("fileSize", 0),
-                        o.optLong("total_size", 0),
-                        o.optLong("totalSize", 0),
-                        o.optLong("size", 0)
-                );
                 out.add(e);
             }
         } catch (Exception ignored) {}
         return out;
     }
 
-    private static String firstNonBlank(String... values) {
-        if (values == null) return "";
-        for (String v : values) {
-            if (v != null && !v.trim().isEmpty() && !"null".equalsIgnoreCase(v.trim())) return v.trim();
-        }
-        return "";
-    }
-
-    private static long firstPositiveLong(long... values) {
-        if (values == null) return 0L;
-        for (long v : values) if (v > 0) return v;
-        return 0L;
-    }
-
     private static JSONArray findArray(Object root) {
         if (root instanceof JSONArray) return (JSONArray) root;
         if (!(root instanceof JSONObject)) return null;
         JSONObject o = (JSONObject) root;
-        String[] keys = {"data", "list", "result", "rows", "downloads", "download_info", "downloadInfo"};
+        String[] keys = {"data", "list", "result", "rows", "downloads"};
         for (String key : keys) {
             Object v = o.opt(key);
             if (v instanceof JSONArray) return (JSONArray) v;
@@ -569,11 +624,7 @@ public final class OriginalAppBridge {
 
     private static class DownloadEntry {
         String resource = "";
-        String completeName = "";
         String downloadTime = "";
-        String videoType = "";
-        String episodeNum = "";
-        long downloadSize = 0L;
         int percent = 0;
         boolean percentKnown = false;
     }
