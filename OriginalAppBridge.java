@@ -277,8 +277,6 @@ public final class OriginalAppBridge {
             return IdentificationResult.fail("Nenhum filme ou episódio individual foi capturado ainda. Faça uma nova captura começando em Downloads > Baixado.");
         }
 
-        listener.onProgress("🔎 Associando títulos pelo tamanho de cada download…");
-
         List<Movie> movies = repo.getAll();
         if (movies.isEmpty()) return IdentificationResult.fail("A biblioteca do Cine Offline está vazia.");
 
@@ -289,61 +287,71 @@ public final class OriginalAppBridge {
             long size = readOriginalDownloadSize(context, movie, resource);
             locals.add(new LocalMovieInfo(movie, resource, size));
         }
-
         if (locals.isEmpty()) {
             return IdentificationResult.fail("Os filmes atuais não guardam o código da pasta. Importe novamente a pasta Filmes no modo rápido e tente de novo.");
         }
 
         Map<String, String> byResource = new HashMap<>();
         Set<String> usedResources = new HashSet<>();
-        int withReadableSize = 0;
-        int matchedBySize = 0;
+        Set<Integer> usedCaptured = new HashSet<>();
+        int matched = 0;
 
-        for (OriginalTitleAccessibilityService.CapturedItem item : captured) {
-            if (item == null || item.title == null || item.title.trim().isEmpty() || item.sizeBytes <= 0) continue;
-            withReadableSize++;
-            long binarySize = parseDisplayedSizeBinary(item.sizeText);
+        // 1) Primeiro tenta usar a própria lista interna de downloads do app original.
+        // Ela fornece o resource exato e, em várias versões, download_size/complete_name.
+        // Isso elimina a principal causa dos itens pendentes: o tamanho mostrado na tela
+        // nem sempre é igual à soma dos campos sz= do index.m3u8.
+        List<DownloadEntry> remote = Collections.emptyList();
+        try {
+            listener.onProgress("🔗 Lendo a lista interna de downloads do app original…");
+            remote = fetchDownloadEntries(context, listener);
+        } catch (Exception ignored) {
+            remote = Collections.emptyList();
+        }
 
-            LocalMovieInfo best = null;
-            LocalMovieInfo second = null;
-            long bestDiff = Long.MAX_VALUE;
-            long secondDiff = Long.MAX_VALUE;
-
-            for (LocalMovieInfo local : locals) {
-                if (local.sizeBytes <= 0 || usedResources.contains(local.resource)) continue;
-                long diffDecimal = Math.abs(local.sizeBytes - item.sizeBytes);
-                long diffBinary = binarySize > 0 ? Math.abs(local.sizeBytes - binarySize) : Long.MAX_VALUE;
-                long diff = Math.min(diffDecimal, diffBinary);
-                if (diff < bestDiff) {
-                    second = best;
-                    secondDiff = bestDiff;
-                    best = local;
-                    bestDiff = diff;
-                } else if (diff < secondDiff) {
-                    second = local;
-                    secondDiff = diff;
-                }
+        if (!remote.isEmpty()) {
+            // Se a versão do app original já devolver o nome junto do resource, usa direto.
+            for (DownloadEntry e : remote) {
+                String resource = normalizeResource(e.resource);
+                String title = cleanCapturedTitle(e.title);
+                if (resource.isEmpty() || title.isEmpty()) continue;
+                byResource.put(resource, title);
+                usedResources.add(resource);
             }
 
-            if (best == null) continue;
-            long referenceSize = binarySize > 0 ? Math.max(item.sizeBytes, binarySize) : item.sizeBytes;
-            long tolerance = Math.max(3_000_000L, Math.round(referenceSize * 0.018));
-            if (bestDiff > tolerance) continue;
+            listener.onProgress("🎯 Ligando nomes aos códigos exatos dos downloads…");
+            matched += matchCapturedToDownloadEntries(context, captured, remote, byResource,
+                    usedResources, usedCaptured);
+        }
 
-            // Se dois arquivos têm praticamente o mesmo tamanho, não adivinha.
-            if (second != null && secondDiff <= tolerance) {
-                long separation = secondDiff - bestDiff;
-                if (separation < Math.max(700_000L, tolerance / 4)) continue;
-            }
+        // 2) Fallback: associa pelo tamanho calculado a partir do conteúdo local.
+        // Usa casamento global (menor erro primeiro), em vez de consumir os itens na ordem
+        // da tela. Isso evita que um episódio de tamanho parecido roube o recurso de outro.
+        listener.onProgress("🔎 Conferindo os itens restantes pelo tamanho local…");
+        matched += matchCapturedToLocalMovies(context, captured, locals, byResource,
+                usedResources, usedCaptured);
 
-            String title = cleanCapturedTitle(item.title);
-            if (title.isEmpty()) continue;
-            byResource.put(best.resource, title);
-            if (item.coverPath != null && !item.coverPath.trim().isEmpty()) {
-                saveCoverForResource(context, best.resource, item.coverPath);
+        // 3) Última tentativa para os ainda pendentes: lê o tamanho REAL dos .dat/.ts
+        // pelo Storage Access Framework. É mais lento, por isso só roda nos pendentes.
+        ArrayList<LocalMovieInfo> unresolvedLocals = new ArrayList<>();
+        for (LocalMovieInfo local : locals) {
+            if (!usedResources.contains(local.resource)) unresolvedLocals.add(local);
+        }
+        boolean hasCapturedPendingWithSize = false;
+        for (int i = 0; i < captured.size(); i++) {
+            OriginalTitleAccessibilityService.CapturedItem item = captured.get(i);
+            if (!usedCaptured.contains(i) && item != null && item.sizeBytes > 0) {
+                hasCapturedPendingWithSize = true;
+                break;
             }
-            usedResources.add(best.resource);
-            matchedBySize++;
+        }
+        if (!unresolvedLocals.isEmpty() && hasCapturedPendingWithSize) {
+            listener.onProgress("📦 Conferindo o tamanho real dos arquivos pendentes…");
+            for (LocalMovieInfo local : unresolvedLocals) {
+                long exact = readActualStoredDownloadSize(context, local.movie, local.resource);
+                if (exact > 0) local.exactSizeBytes = exact;
+            }
+            matched += matchCapturedToLocalMovies(context, captured, unresolvedLocals, byResource,
+                    usedResources, usedCaptured);
         }
 
         if (byResource.isEmpty()) {
@@ -355,10 +363,176 @@ public final class OriginalAppBridge {
         saveMappings(context, byResource);
         listener.onProgress("💾 Salvando filmes e episódios reconhecidos…");
         IdentificationResult result = applyMappingsToLibrary(context, repo, byResource,
-                captured.size(), matchedBySize,
-                "As temporadas agrupadas foram abertas automaticamente e os episódios foram associados pelo tamanho do download, sem depender da ordem da lista. As associações ficam no backup.");
+                captured.size(), byResource.size(),
+                "A associação usa o código exato do download quando o app original o disponibiliza e confere os tamanhos reais dos arquivos nos casos pendentes. As associações ficam no backup.");
         autoOrganizeRecognizedSeries(context, repo);
         return result;
+    }
+
+    private static int matchCapturedToDownloadEntries(Context context,
+                                                       List<OriginalTitleAccessibilityService.CapturedItem> captured,
+                                                       List<DownloadEntry> entries,
+                                                       Map<String, String> byResource,
+                                                       Set<String> usedResources,
+                                                       Set<Integer> usedCaptured) {
+        ArrayList<SizeCandidate> candidates = new ArrayList<>();
+        for (int i = 0; i < captured.size(); i++) {
+            if (usedCaptured.contains(i)) continue;
+            OriginalTitleAccessibilityService.CapturedItem item = captured.get(i);
+            if (item == null || item.sizeBytes <= 0 || cleanCapturedTitle(item.title).isEmpty()) continue;
+            long binary = parseDisplayedSizeBinary(item.sizeText);
+            for (DownloadEntry e : entries) {
+                String resource = normalizeResource(e.resource);
+                if (resource.isEmpty() || usedResources.contains(resource) || e.sizeBytes <= 0) continue;
+                long diff = sizeDifference(e.sizeBytes, item.sizeBytes, binary);
+                double ratio = diff / (double) Math.max(1L, Math.max(e.sizeBytes, Math.max(item.sizeBytes, binary)));
+                // Com download_size vindo do app original, 3,5% já cobre arredondamento e pequenas diferenças.
+                if (ratio <= 0.035d || diff <= 5_000_000L) {
+                    candidates.add(new SizeCandidate(i, resource, e.sizeBytes, diff, ratio));
+                }
+            }
+        }
+        return applySizeCandidates(context, captured, candidates, byResource, usedResources, usedCaptured, true);
+    }
+
+    private static int matchCapturedToLocalMovies(Context context,
+                                                   List<OriginalTitleAccessibilityService.CapturedItem> captured,
+                                                   List<LocalMovieInfo> locals,
+                                                   Map<String, String> byResource,
+                                                   Set<String> usedResources,
+                                                   Set<Integer> usedCaptured) {
+        ArrayList<SizeCandidate> candidates = new ArrayList<>();
+        for (int i = 0; i < captured.size(); i++) {
+            if (usedCaptured.contains(i)) continue;
+            OriginalTitleAccessibilityService.CapturedItem item = captured.get(i);
+            if (item == null || item.sizeBytes <= 0 || cleanCapturedTitle(item.title).isEmpty()) continue;
+            long binary = parseDisplayedSizeBinary(item.sizeText);
+            for (LocalMovieInfo local : locals) {
+                if (usedResources.contains(local.resource)) continue;
+                long localSize = local.exactSizeBytes > 0 ? local.exactSizeBytes : local.sizeBytes;
+                if (localSize <= 0) continue;
+                long diff = sizeDifference(localSize, item.sizeBytes, binary);
+                long reference = Math.max(localSize, Math.max(item.sizeBytes, binary));
+                double ratio = diff / (double) Math.max(1L, reference);
+                // O index.m3u8 pode ter um total um pouco diferente do tamanho exibido.
+                // No tamanho real dos arquivos a diferença normalmente cai bastante.
+                if (ratio <= 0.065d || diff <= 7_000_000L) {
+                    candidates.add(new SizeCandidate(i, local.resource, localSize, diff, ratio));
+                }
+            }
+        }
+        return applySizeCandidates(context, captured, candidates, byResource, usedResources, usedCaptured, false);
+    }
+
+    private static int applySizeCandidates(Context context,
+                                            List<OriginalTitleAccessibilityService.CapturedItem> captured,
+                                            List<SizeCandidate> candidates,
+                                            Map<String, String> byResource,
+                                            Set<String> usedResources,
+                                            Set<Integer> usedCaptured,
+                                            boolean exactSource) {
+        Collections.sort(candidates, (a, b) -> {
+            int r = Double.compare(a.ratio, b.ratio);
+            if (r != 0) return r;
+            return Long.compare(a.diff, b.diff);
+        });
+
+        int matched = 0;
+        for (SizeCandidate c : candidates) {
+            if (usedCaptured.contains(c.capturedIndex) || usedResources.contains(c.resource)) continue;
+
+            // Confere se existe outro recurso quase empatado para o mesmo nome.
+            // Com o download_size do app original podemos ser mais permissivos; no fallback
+            // local exigimos uma separação maior para não colocar nome no vídeo errado.
+            SizeCandidate second = null;
+            for (SizeCandidate other : candidates) {
+                if (other == c || other.capturedIndex != c.capturedIndex) continue;
+                if (usedResources.contains(other.resource)) continue;
+                if (second == null || other.ratio < second.ratio
+                        || (other.ratio == second.ratio && other.diff < second.diff)) second = other;
+            }
+            if (second != null) {
+                double gap = second.ratio - c.ratio;
+                long diffGap = second.diff - c.diff;
+                double requiredGap = exactSource ? 0.0015d : 0.0035d;
+                long requiredBytes = exactSource ? 350_000L : 900_000L;
+                if (gap < requiredGap && diffGap < requiredBytes) continue;
+            }
+
+            OriginalTitleAccessibilityService.CapturedItem item = captured.get(c.capturedIndex);
+            String title = cleanCapturedTitle(item.title);
+            if (title.isEmpty()) continue;
+            byResource.put(c.resource, title);
+            if (item.coverPath != null && !item.coverPath.trim().isEmpty()) {
+                saveCoverForResource(context, c.resource, item.coverPath);
+            }
+            usedCaptured.add(c.capturedIndex);
+            usedResources.add(c.resource);
+            matched++;
+        }
+        return matched;
+    }
+
+    private static long sizeDifference(long target, long decimalShown, long binaryShown) {
+        if (target <= 0) return Long.MAX_VALUE;
+        long best = Long.MAX_VALUE;
+        if (decimalShown > 0) best = Math.min(best, Math.abs(target - decimalShown));
+        if (binaryShown > 0) best = Math.min(best, Math.abs(target - binaryShown));
+        return best;
+    }
+
+    private static long readActualStoredDownloadSize(Context context, Movie movie, String resource) {
+        if (context == null || movie == null || resource == null || resource.isEmpty()) return 0L;
+        String source = movie.sourceUri == null ? "" : movie.sourceUri.trim();
+        if (source.isEmpty()) return 0L;
+        android.database.Cursor cursor = null;
+        try {
+            Uri tree = Uri.parse(source);
+            String treeDocId = DocumentsContract.getTreeDocumentId(tree);
+            if (treeDocId == null || treeDocId.isEmpty()) return 0L;
+            String folderDocId = treeDocId;
+            String decoded = Uri.decode(treeDocId);
+            if (!decoded.toUpperCase(Locale.ROOT).endsWith(resource.toUpperCase(Locale.ROOT))) {
+                folderDocId = treeDocId + "/" + resource;
+            }
+            Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, folderDocId);
+            String[] projection = new String[]{
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_SIZE
+            };
+            cursor = context.getContentResolver().query(children, projection, null, null, null);
+            if (cursor == null) return 0L;
+            int nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+            int sizeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE);
+            long total = 0L;
+            while (cursor.moveToNext()) {
+                String name = nameCol >= 0 ? cursor.getString(nameCol) : "";
+                if (name == null) continue;
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (!lower.endsWith(".dat") && !lower.endsWith(".ts")) continue;
+                if (sizeCol >= 0 && !cursor.isNull(sizeCol)) total += Math.max(0L, cursor.getLong(sizeCol));
+            }
+            return total;
+        } catch (Exception ignored) {
+            return 0L;
+        } finally {
+            if (cursor != null) try { cursor.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private static final class SizeCandidate {
+        final int capturedIndex;
+        final String resource;
+        final long targetSize;
+        final long diff;
+        final double ratio;
+        SizeCandidate(int capturedIndex, String resource, long targetSize, long diff, double ratio) {
+            this.capturedIndex = capturedIndex;
+            this.resource = resource;
+            this.targetSize = targetSize;
+            this.diff = diff;
+            this.ratio = ratio;
+        }
     }
 
     private static IdentificationResult applyMappingsToLibrary(Context context, MovieRepository repo, Map<String, String> byResource,
@@ -492,10 +666,12 @@ public final class OriginalAppBridge {
         final Movie movie;
         final String resource;
         final long sizeBytes;
+        long exactSizeBytes;
         LocalMovieInfo(Movie movie, String resource, long sizeBytes) {
             this.movie = movie;
             this.resource = resource;
             this.sizeBytes = sizeBytes;
+            this.exactSizeBytes = 0L;
         }
     }
 
@@ -677,7 +853,8 @@ public final class OriginalAppBridge {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.optJSONObject(i);
                 if (o == null) continue;
-                String resource = o.optString("resource", "");
+                String resource = o.optString("resource", o.optString("streamid", o.optString("streamId", "")));
+                resource = normalizeResource(resource);
                 if (resource.isEmpty()) continue;
                 DownloadEntry e = new DownloadEntry();
                 e.resource = resource;
@@ -689,10 +866,58 @@ public final class OriginalAppBridge {
                     e.percentKnown = true;
                     e.percent = o.optInt("downloadPercent", 0);
                 }
+
+                Object sizeValue = o.has("download_size") ? o.opt("download_size")
+                        : (o.has("downloadSize") ? o.opt("downloadSize")
+                        : (o.has("total_size") ? o.opt("total_size")
+                        : (o.has("totalSize") ? o.opt("totalSize") : o.opt("size"))));
+                e.sizeBytes = parseServerSize(sizeValue);
+
+                String title = firstNonEmpty(
+                        o.optString("complete_name", ""),
+                        o.optString("completeName", ""),
+                        o.optString("name", ""),
+                        o.optString("title", "")
+                );
+                e.title = cleanCapturedTitle(title);
                 out.add(e);
             }
         } catch (Exception ignored) {}
         return out;
+    }
+
+    private static String firstNonEmpty(String... values) {
+        if (values == null) return "";
+        for (String v : values) if (v != null && !v.trim().isEmpty()) return v.trim();
+        return "";
+    }
+
+    private static long parseServerSize(Object value) {
+        if (value == null || value == JSONObject.NULL) return 0L;
+        if (value instanceof Number) {
+            long n = ((Number) value).longValue();
+            return Math.max(0L, n);
+        }
+        String s = String.valueOf(value).trim();
+        if (s.isEmpty()) return 0L;
+        Matcher withUnit = Pattern.compile("(?i)(\\d{1,12}(?:[.,]\\d{1,4})?)\\s*(B|KB|MB|GB|TB)").matcher(s);
+        if (withUnit.find()) {
+            try {
+                double n = Double.parseDouble(withUnit.group(1).replace(',', '.'));
+                String u = withUnit.group(2).toUpperCase(Locale.ROOT);
+                double mul = 1d;
+                if ("KB".equals(u)) mul = 1_000d;
+                else if ("MB".equals(u)) mul = 1_000_000d;
+                else if ("GB".equals(u)) mul = 1_000_000_000d;
+                else if ("TB".equals(u)) mul = 1_000_000_000_000d;
+                return Math.max(0L, Math.round(n * mul));
+            } catch (Exception ignored) {}
+        }
+        String digits = s.replaceAll("[^0-9]", "");
+        if (!digits.isEmpty()) {
+            try { return Math.max(0L, Long.parseLong(digits)); } catch (Exception ignored) {}
+        }
+        return 0L;
     }
 
     private static JSONArray findArray(Object root) {
@@ -714,6 +939,8 @@ public final class OriginalAppBridge {
     private static class DownloadEntry {
         String resource = "";
         String downloadTime = "";
+        String title = "";
+        long sizeBytes = 0L;
         int percent = 0;
         boolean percentKnown = false;
     }

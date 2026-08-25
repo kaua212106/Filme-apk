@@ -798,8 +798,12 @@ public class MainActivity extends Activity {
                         .append("• ").append(result.capturedTitles).append(" nomes capturados\n")
                         .append("• ").append(result.completedDownloads).append(" downloads associados\n")
                         .append("• ").append(saved).append(" associação(ões) guardada(s) no celular");
-                if (result.notMatched > 0) msg.append("\n• ").append(result.notMatched).append(" item(ns) da biblioteca ainda sem associação");
-                msg.append("\n\nAgora você pode apagar esses downloads do app original. Para se proteger caso desinstale o Cine Offline, use também ‘Exportar backup da organização’. ");
+                if (result.notMatched > 0) {
+                    msg.append("\n• ").append(result.notMatched).append(" item(ns) da biblioteca ainda sem associação");
+                    msg.append("\n\n⚠️ Ainda NÃO apague os downloads do app original. Faça outra tentativa enquanto eles ainda estão lá, para o Cine Offline conseguir salvar os itens pendentes.");
+                } else {
+                    msg.append("\n\n✅ Todos os itens da biblioteca foram associados. Agora você pode apagar esses downloads do app original. Para se proteger caso desinstale o Cine Offline, use também ‘Exportar backup da organização’. ");
+                }
 
                 new AlertDialog.Builder(this)
                         .setTitle("Nomes salvos")
