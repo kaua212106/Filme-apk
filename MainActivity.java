@@ -619,6 +619,10 @@ public class MainActivity extends Activity {
         int saved = OriginalAppBridge.getSavedMappingCount(this);
         boolean finished = OriginalAppBridge.isCaptureFinished(this);
 
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(20), dp(6), dp(20), dp(8));
+
         StringBuilder status = new StringBuilder();
         status.append("Esse método usa somente a tela de Downloads do app original e não precisa de root.\n\n");
         status.append("App original: ").append(installed ? "✅ instalado" : "❌ não encontrado").append('\n');
@@ -628,53 +632,108 @@ public class MainActivity extends Activity {
         status.append('\n').append("Associações salvas: ").append(saved).append(" nome(s)");
         status.append("\n\nDepois de associar e salvar, você pode remover os downloads do app original. Os nomes continuam guardados no Cine Offline e também entram no backup da organização.");
 
-        ArrayList<String> options = new ArrayList<>();
-        ArrayList<Integer> actions = new ArrayList<>();
+        TextView statusView = text(status.toString(), 14, false, Ui.TEXT);
+        statusView.setLineSpacing(0f, 1.08f);
+        content.addView(statusView);
+
+        TextView hint = text("Ações", 12, true, Ui.MUTED);
+        hint.setPadding(0, dp(18), 0, dp(8));
+        content.addView(hint);
+
+        TextView accessibilityBtn = null;
         if (!accessibility) {
-            options.add("Ativar acessibilidade do Cine Offline"); actions.add(1);
-        }
-        if (installed && accessibility) {
-            options.add("Capturar nomes nos Downloads"); actions.add(2);
-        }
-        if (captured > 0) {
-            options.add("Associar captura aos arquivos e salvar"); actions.add(3);
-        }
-        if (saved > 0) {
-            options.add("Aplicar nomes já salvos à biblioteca"); actions.add(4);
-        }
-        if (captured > 0) {
-            options.add("Limpar somente a captura atual"); actions.add(5);
+            accessibilityBtn = modalActionButton("⚙ Ativar acessibilidade", false);
+            content.addView(accessibilityBtn);
         }
 
-        AlertDialog.Builder b = new AlertDialog.Builder(this)
-                .setTitle("Pegar nomes do app original")
-                .setMessage(status.toString())
-                .setNegativeButton("Fechar", null);
-        if (options.isEmpty()) {
-            b.setPositiveButton("OK", null).show();
-            return;
+        TextView openBtn = null;
+        if (installed) {
+            openBtn = modalActionButton(accessibility
+                    ? "▶ Capturar nomes e abrir app original"
+                    : "↗ Abrir app original", true);
+            content.addView(openBtn);
         }
-        b.setItems(options.toArray(new String[0]), (d, which) -> {
-            int action = actions.get(which);
-            if (action == 1) {
-                new AlertDialog.Builder(this)
-                        .setTitle("Ativar acessibilidade")
-                        .setMessage("Na tela de Acessibilidade, procure Cine Offline e ative o serviço de captura de títulos. Ele é limitado ao pacote do app original. Depois volte ao Cine Offline.")
-                        .setNegativeButton("Cancelar", null)
-                        .setPositiveButton("Abrir Acessibilidade", (x, y) -> OriginalAppBridge.openAccessibilitySettings(this))
-                        .show();
-            } else if (action == 2) {
-                explainAndStartOriginalCapture();
-            } else if (action == 3) {
+
+        TextView saveBtn = null;
+        if (captured > 0) {
+            saveBtn = modalActionButton("💾 Associar captura aos arquivos e salvar", false);
+            content.addView(saveBtn);
+        }
+
+        TextView applyBtn = null;
+        if (saved > 0) {
+            applyBtn = modalActionButton("↻ Aplicar nomes já salvos à biblioteca", false);
+            content.addView(applyBtn);
+        }
+
+        TextView clearBtn = null;
+        if (captured > 0) {
+            clearBtn = modalActionButton("🗑 Limpar somente a captura atual", false);
+            content.addView(clearBtn);
+        }
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.addView(content);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Pegar nomes do app original")
+                .setView(scroll)
+                .setNegativeButton("Fechar", null)
+                .create();
+
+        if (accessibilityBtn != null) {
+            accessibilityBtn.setOnClickListener(v -> {
+                dialog.dismiss();
+                Toast.makeText(this, "Ative o serviço Cine Offline e depois volte ao app.", Toast.LENGTH_LONG).show();
+                OriginalAppBridge.openAccessibilitySettings(this);
+            });
+        }
+
+        if (openBtn != null) {
+            openBtn.setOnClickListener(v -> {
+                dialog.dismiss();
+                if (OriginalAppBridge.isAccessibilityEnabled(this)) {
+                    OriginalAppBridge.beginCapture(this);
+                    if (!OriginalAppBridge.openOriginalApp(this)) {
+                        Toast.makeText(this, "Não consegui abrir o app original.", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    Toast.makeText(this, "Vá em Downloads > Concluídos e deixe a lista no topo. A captura começou.", Toast.LENGTH_LONG).show();
+                } else {
+                    if (!OriginalAppBridge.openOriginalApp(this)) {
+                        Toast.makeText(this, "Não consegui abrir o app original.", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    Toast.makeText(this, "O app original foi aberto. Para capturar os nomes, ative a Acessibilidade do Cine Offline.", Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+
+        if (saveBtn != null) {
+            saveBtn.setOnClickListener(v -> {
+                dialog.dismiss();
                 applyOriginalCapturedNames();
-            } else if (action == 4) {
+            });
+        }
+
+        if (applyBtn != null) {
+            applyBtn.setOnClickListener(v -> {
+                dialog.dismiss();
                 applySavedOriginalNames();
-            } else if (action == 5) {
+            });
+        }
+
+        if (clearBtn != null) {
+            clearBtn.setOnClickListener(v -> {
                 OriginalAppBridge.clearCapture(this);
+                dialog.dismiss();
                 Toast.makeText(this, "Captura atual apagada. Os nomes já salvos foram mantidos.", Toast.LENGTH_LONG).show();
                 renderPage();
-            }
-        }).show();
+            });
+        }
+
+        dialog.show();
     }
 
     private void explainAndStartOriginalCapture() {
@@ -1975,6 +2034,30 @@ public class MainActivity extends Activity {
         long sec = total % 60;
         return h > 0 ? String.format(Locale.getDefault(), "%d:%02d:%02d", h, min, sec)
                 : String.format(Locale.getDefault(), "%d:%02d", min, sec);
+    }
+
+    private TextView modalActionButton(String label, boolean primary) {
+        TextView button = text(label, 14, true, primary ? Color.WHITE : Ui.TEXT);
+        button.setGravity(Gravity.CENTER);
+        button.setPadding(dp(14), dp(13), dp(14), dp(13));
+        button.setClickable(true);
+        button.setFocusable(true);
+
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setCornerRadius(dp(14));
+        if (primary) {
+            bg.setColor(Ui.PURPLE);
+        } else {
+            bg.setColor(Color.rgb(246, 246, 252));
+            bg.setStroke(dp(1), Color.rgb(226, 226, 238));
+        }
+        button.setBackground(bg);
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(7), 0, 0);
+        button.setLayoutParams(lp);
+        return button;
     }
 
     private TextView text(String value, float size, boolean bold, int color) {
