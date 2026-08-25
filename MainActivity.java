@@ -16,6 +16,7 @@ import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -584,11 +585,11 @@ public class MainActivity extends Activity {
         capture.setOnClickListener(v -> showOriginalTitleTools());
         pageContent.addView(capture);
 
-        LinearLayout backup = settingsCard("⇩", "Exportar backup da organização", "Salva nomes, séries, episódios, favoritos e progresso em um JSON pequeno");
+        LinearLayout backup = settingsCard("⇩", "Exportar backup da organização", "Salva nomes e capas atuais, inclusive alterações manuais, além de séries, favoritos e progresso");
         backup.setOnClickListener(v -> createBackupDocument());
         pageContent.addView(backup);
 
-        LinearLayout restore = settingsCard("⇧", "Importar backup da organização", "Restaura os nomes e séries depois de reinstalar e importar a pasta novamente");
+        LinearLayout restore = settingsCard("⇧", "Importar backup da organização", "Restaura nomes e capas manuais com prioridade sobre os dados capturados do app original");
         restore.setOnClickListener(v -> pickBackupDocument());
         pageContent.addView(restore);
 
@@ -1992,11 +1993,16 @@ public class MainActivity extends Activity {
 
             List<Movie> all = repo.getAll();
             JSONArray movies = new JSONArray();
+            JSONObject libraryCovers = new JSONObject();
+            int libraryCoverCount = 0;
             Map<String, Movie> byId = new HashMap<>();
             for (Movie m : all) {
                 byId.put(m.id, m);
+                String movieKey = stableMovieKey(m);
                 JSONObject o = new JSONObject();
-                o.put("key", stableMovieKey(m));
+                o.put("key", movieKey);
+                // O título que está visível na biblioteca é a fonte de verdade do backup.
+                // Isso inclui qualquer renomeação feita manualmente pelo usuário.
                 o.put("title", m.title);
                 o.put("durationMs", m.durationMs);
                 o.put("favorite", m.favorite);
@@ -2004,8 +2010,18 @@ public class MainActivity extends Activity {
                 o.put("lastPlayedAt", m.lastPlayedAt);
                 o.put("playCount", m.playCount);
                 movies.put(o);
+
+                // Salva a capa REAL que está sendo usada na biblioteca, e não apenas
+                // as capas capturadas do app original. Assim capas escolhidas manualmente
+                // também sobrevivem a uma reinstalação/restauração.
+                String coverBase64 = encodeMovieCoverForBackup(m);
+                if (!coverBase64.isEmpty()) {
+                    libraryCovers.put(movieKey, coverBase64);
+                    libraryCoverCount++;
+                }
             }
             root.put("movies", movies);
+            root.put("libraryCovers", libraryCovers);
 
             JSONArray series = new JSONArray();
             for (SeriesRepository.SeriesInfo item : seriesRepo.getAllSeries()) {
@@ -2039,7 +2055,8 @@ public class MainActivity extends Activity {
                 if (out == null) throw new Exception("Não foi possível abrir o arquivo de destino.");
                 out.write(root.toString(2).getBytes(StandardCharsets.UTF_8));
             }
-            Toast.makeText(this, "Backup salvo. Guarde esse JSON fora do app.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Backup salvo: " + all.size() + " item(ns) e "
+                    + libraryCoverCount + " capa(s) atuais incluída(s).", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             Toast.makeText(this, "Falha ao criar backup: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
@@ -2069,6 +2086,13 @@ public class MainActivity extends Activity {
     private void restoreBackup(JSONObject root) throws Exception {
         int restoredOriginalMappings = OriginalAppBridge.importSavedMappings(this, root.optJSONObject("originalMappings"));
         int restoredOriginalCovers = OriginalAppBridge.importSavedCovers(this, root.optJSONObject("originalCovers"));
+
+        // Primeiro aplica os dados capturados do app original como FALLBACK.
+        // Depois os dados de movies[] e libraryCovers são aplicados por cima.
+        // Isso é importante: uma renomeação/capa manual do usuário nunca deve ser
+        // substituída pelo nome/capa antiga existente em originalMappings/originalCovers.
+        try { OriginalAppBridge.applySavedMappings(this, repo); } catch (Exception ignored) {}
+
         List<Movie> current = repo.getAll();
         Map<String, Movie> currentByKey = new HashMap<>();
         Map<Long, List<Movie>> currentByDuration = new HashMap<>();
@@ -2083,8 +2107,10 @@ public class MainActivity extends Activity {
         }
 
         JSONArray savedMovies = root.optJSONArray("movies");
+        JSONObject savedLibraryCovers = root.optJSONObject("libraryCovers");
         Map<String, Movie> restoredBySavedKey = new HashMap<>();
         int restoredNames = 0;
+        int restoredLibraryCovers = 0;
         if (savedMovies != null) {
             for (int i = 0; i < savedMovies.length(); i++) {
                 JSONObject o = savedMovies.optJSONObject(i);
@@ -2100,19 +2126,30 @@ public class MainActivity extends Activity {
                 }
                 if (target == null) continue;
 
+                // O que foi salvo em movies[].title tem prioridade máxima.
+                // É exatamente o nome que o usuário via no momento da exportação.
                 String title = o.optString("title", "").trim();
                 if (!title.isEmpty()) target.title = title;
                 target.favorite = o.optBoolean("favorite", target.favorite);
                 target.progressMs = Math.max(0, o.optLong("progressMs", target.progressMs));
                 target.lastPlayedAt = Math.max(0, o.optLong("lastPlayedAt", target.lastPlayedAt));
                 target.playCount = Math.max(0, o.optInt("playCount", target.playCount));
+
+                // Nas versões novas do backup, libraryCovers contém a capa atual da
+                // biblioteca (inclusive a escolhida manualmente). Ela também tem prioridade
+                // sobre a capa capturada do app original que foi aplicada acima.
+                if (savedLibraryCovers != null) {
+                    String coverBase64 = savedLibraryCovers.optString(savedKey, "");
+                    if (!coverBase64.isEmpty() && restoreMovieCoverFromBackup(target, coverBase64)) {
+                        restoredLibraryCovers++;
+                    }
+                }
+
                 restoredBySavedKey.put(savedKey, target);
                 restoredNames++;
             }
         }
         repo.saveAll(current);
-        // Reaplica também as capas salvas por código da pasta.
-        try { OriginalAppBridge.applySavedMappings(this, repo); } catch (Exception ignored) {}
 
         // Recria as séries do backup e depois liga cada episódio ao filme atual correspondente.
         for (SeriesRepository.SeriesInfo old : new ArrayList<>(seriesRepo.getAllSeries())) {
@@ -2149,16 +2186,121 @@ public class MainActivity extends Activity {
             }
         }
 
+        int coversAvailable = countExistingLibraryCovers(repo.getAll());
         renderPage();
+        StringBuilder restoreMessage = new StringBuilder();
+        restoreMessage.append(restoredNames).append(" item(ns) tiveram nomes/dados restaurados.\n")
+                .append(newSeriesIds.size()).append(" série(s) recriada(s).\n")
+                .append(restoredEpisodes).append(" episódio(s) reorganizado(s).\n")
+                .append(restoredOriginalMappings).append(" associação(ões) do app original restaurada(s).\n");
+        if (savedLibraryCovers != null) {
+            restoreMessage.append(restoredLibraryCovers)
+                    .append(" capa(s) atuais/manuais restaurada(s) do backup.\n");
+        } else {
+            restoreMessage.append("Backup antigo: usando as capas capturadas disponíveis.\n");
+        }
+        restoreMessage.append(coversAvailable).append(" capa(s) disponível(is) na biblioteca agora.");
+
         new AlertDialog.Builder(this)
                 .setTitle("Backup restaurado")
-                .setMessage(restoredNames + " item(ns) tiveram nomes/dados restaurados.\n" +
-                        newSeriesIds.size() + " série(s) recriada(s).\n" +
-                        restoredEpisodes + " episódio(s) reorganizado(s).\n" +
-                        restoredOriginalMappings + " associação(ões) do app original restaurada(s).\n" +
-                        restoredOriginalCovers + " capa(s) restaurada(s).")
+                .setMessage(restoreMessage.toString())
                 .setPositiveButton("OK", null)
                 .show();
+    }
+
+    /**
+     * Converte a capa que está realmente em uso na biblioteca para uma imagem compacta
+     * dentro do JSON. O arquivo manual pode vir enorme da galeria, então reduzimos para
+     * no máximo 480x720 e JPEG para o backup não crescer desnecessariamente.
+     */
+    private String encodeMovieCoverForBackup(Movie movie) {
+        if (movie == null) return "";
+        File cover = null;
+        if (movie.coverPath != null && !movie.coverPath.trim().isEmpty()) {
+            File candidate = new File(movie.coverPath);
+            if (candidate.exists() && candidate.isFile() && candidate.length() > 0) cover = candidate;
+        }
+        if (cover == null && movie.folderPath != null && !movie.folderPath.trim().isEmpty()) {
+            File candidate = new File(movie.folderPath, "cover.jpg");
+            if (candidate.exists() && candidate.isFile() && candidate.length() > 0) cover = candidate;
+        }
+        if (cover == null) return "";
+
+        Bitmap bitmap = null;
+        Bitmap scaled = null;
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(cover.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return "";
+
+            int sample = 1;
+            while ((bounds.outWidth / sample) > 960 || (bounds.outHeight / sample) > 1440) {
+                sample *= 2;
+            }
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = Math.max(1, sample);
+            bitmap = BitmapFactory.decodeFile(cover.getAbsolutePath(), opts);
+            if (bitmap == null) return "";
+
+            int w = bitmap.getWidth();
+            int h = bitmap.getHeight();
+            float scale = Math.min(1f, Math.min(480f / Math.max(1, w), 720f / Math.max(1, h)));
+            if (scale < 0.999f) {
+                scaled = Bitmap.createScaledBitmap(bitmap, Math.max(1, Math.round(w * scale)),
+                        Math.max(1, Math.round(h * scale)), true);
+            } else {
+                scaled = bitmap;
+            }
+
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, 86, bos)) return "";
+            byte[] bytes = bos.toByteArray();
+            if (bytes.length == 0 || bytes.length > 900_000) return "";
+            return Base64.encodeToString(bytes, Base64.NO_WRAP);
+        } catch (Exception ignored) {
+            return "";
+        } finally {
+            if (scaled != null && scaled != bitmap && !scaled.isRecycled()) scaled.recycle();
+            if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+        }
+    }
+
+    private boolean restoreMovieCoverFromBackup(Movie movie, String base64) {
+        if (movie == null || base64 == null || base64.trim().isEmpty()) return false;
+        try {
+            byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+            if (bytes.length == 0 || bytes.length > 1_200_000) return false;
+            File dir = new File(movie.folderPath);
+            if (!dir.exists() && !dir.mkdirs()) return false;
+            File out = new File(dir, "cover.jpg");
+            try (FileOutputStream fos = new FileOutputStream(out)) {
+                fos.write(bytes);
+            }
+            if (!out.exists() || out.length() <= 0) return false;
+            movie.coverPath = out.getAbsolutePath();
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private int countExistingLibraryCovers(List<Movie> movies) {
+        int count = 0;
+        if (movies == null) return 0;
+        for (Movie movie : movies) {
+            if (movie == null) continue;
+            File cover = null;
+            if (movie.coverPath != null && !movie.coverPath.trim().isEmpty()) {
+                cover = new File(movie.coverPath);
+            }
+            if ((cover == null || !cover.exists() || cover.length() <= 0)
+                    && movie.folderPath != null && !movie.folderPath.trim().isEmpty()) {
+                cover = new File(movie.folderPath, "cover.jpg");
+            }
+            if (cover != null && cover.exists() && cover.isFile() && cover.length() > 0) count++;
+        }
+        return count;
     }
 
     /**
