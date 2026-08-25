@@ -8,6 +8,7 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.provider.Settings;
 import android.provider.DocumentsContract;
+import android.util.Base64;
 import android.view.accessibility.AccessibilityManager;
 
 import org.json.JSONArray;
@@ -16,6 +17,8 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
@@ -176,6 +179,87 @@ public final class OriginalAppBridge {
         return incoming.size();
     }
 
+    private static File savedCoverFile(Context context, String resource) {
+        String key = normalizeResource(resource);
+        if (key.isEmpty()) return null;
+        File dir = new File(context.getFilesDir(), "original_covers");
+        if (!dir.exists()) dir.mkdirs();
+        return new File(dir, key + ".jpg");
+    }
+
+    private static boolean saveCoverForResource(Context context, String resource, String sourcePath) {
+        if (sourcePath == null || sourcePath.trim().isEmpty()) return false;
+        File src = new File(sourcePath);
+        File dst = savedCoverFile(context, resource);
+        if (!src.exists() || src.length() <= 0 || dst == null) return false;
+        try (InputStream in = new FileInputStream(src); FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[32768];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            return dst.length() > 0;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean applySavedCover(Context context, Movie movie, String resource) {
+        if (movie == null) return false;
+        File src = savedCoverFile(context, resource);
+        if (src == null || !src.exists() || src.length() <= 0) return false;
+        File dst = new File(movie.folderPath, "cover.jpg");
+        try (InputStream in = new FileInputStream(src); FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[32768];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            movie.coverPath = dst.getAbsolutePath();
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /** Capas capturadas do app original, usadas pelo backup da organização. */
+    public static JSONObject exportSavedCovers(Context context) {
+        JSONObject out = new JSONObject();
+        File dir = new File(context.getFilesDir(), "original_covers");
+        File[] files = dir.listFiles();
+        if (files == null) return out;
+        for (File f : files) {
+            if (f == null || !f.isFile() || !f.getName().toLowerCase(Locale.ROOT).endsWith(".jpg")) continue;
+            String resource = normalizeResource(f.getName().substring(0, f.getName().length() - 4));
+            if (resource.isEmpty() || f.length() <= 0 || f.length() > 600_000) continue;
+            try (InputStream in = new FileInputStream(f); ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) > 0 && bos.size() <= 650_000) bos.write(buf, 0, n);
+                out.put(resource, Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP));
+            } catch (Exception ignored) {}
+        }
+        return out;
+    }
+
+    public static int importSavedCovers(Context context, JSONObject object) {
+        if (object == null) return 0;
+        int restored = 0;
+        JSONArray names = object.names();
+        if (names == null) return 0;
+        for (int i = 0; i < names.length(); i++) {
+            String rawKey = names.optString(i, "");
+            String resource = normalizeResource(rawKey);
+            String b64 = object.optString(rawKey, "");
+            if (resource.isEmpty() || b64.isEmpty()) continue;
+            try {
+                byte[] bytes = Base64.decode(b64, Base64.DEFAULT);
+                if (bytes.length == 0 || bytes.length > 700_000) continue;
+                File dst = savedCoverFile(context, resource);
+                if (dst == null) continue;
+                try (FileOutputStream out = new FileOutputStream(dst)) { out.write(bytes); }
+                restored++;
+            } catch (Exception ignored) {}
+        }
+        return restored;
+    }
+
     public static IdentificationResult applySavedMappings(Context context, MovieRepository repo) {
         Map<String, String> byResource = getSavedMappings(context);
         if (byResource.isEmpty()) return IdentificationResult.fail("Nenhuma associação de nome foi salva ainda.");
@@ -255,6 +339,9 @@ public final class OriginalAppBridge {
             String title = cleanCapturedTitle(item.title);
             if (title.isEmpty()) continue;
             byResource.put(best.resource, title);
+            if (item.coverPath != null && !item.coverPath.trim().isEmpty()) {
+                saveCoverForResource(context, best.resource, item.coverPath);
+            }
             usedResources.add(best.resource);
             matchedBySize++;
         }
@@ -295,11 +382,13 @@ public final class OriginalAppBridge {
                 notMatched++;
                 continue;
             }
+            boolean coverApplied = applySavedCover(context, movie, resource);
             if (!title.equals(movie.title)) {
                 movie.title = title;
                 repo.save(movie);
                 renamed++;
             } else {
+                if (coverApplied) repo.save(movie);
                 unchanged++;
             }
         }

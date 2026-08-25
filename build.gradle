@@ -57,6 +57,7 @@ def prepareGeneratedRes = tasks.register('prepareGeneratedRes') {
     android:accessibilityFeedbackType="feedbackGeneric"
     android:notificationTimeout="120"
     android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
     android:packageNames="com.starshort.minishort" />
 '''

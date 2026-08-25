@@ -2,6 +2,10 @@ package com.offlineplayer.cineoffline;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
+import android.os.Build;
+import android.view.Display;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -12,6 +16,8 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -61,12 +67,23 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         final long sizeBytes;
         final String sizeText;
         final String groupTitle;
+        String coverPath;
 
-        CapturedItem(String title, long sizeBytes, String sizeText, String groupTitle) {
+        CapturedItem(String title, long sizeBytes, String sizeText, String groupTitle, String coverPath) {
             this.title = title == null ? "" : title;
             this.sizeBytes = Math.max(0L, sizeBytes);
             this.sizeText = sizeText == null ? "" : sizeText;
             this.groupTitle = groupTitle == null ? "" : groupTitle;
+            this.coverPath = coverPath == null ? "" : coverPath;
+        }
+    }
+
+    private static final class CoverTarget {
+        final CapturedItem item;
+        final Rect bounds;
+        CoverTarget(CapturedItem item, Rect bounds) {
+            this.item = item;
+            this.bounds = bounds;
         }
     }
 
@@ -132,7 +149,8 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
                         title,
                         o.optLong("sizeBytes", 0L),
                         o.optString("sizeText", ""),
-                        o.optString("groupTitle", "")
+                        o.optString("groupTitle", ""),
+                        o.optString("coverPath", "")
                 ));
             }
         } catch (Exception ignored) {}
@@ -222,6 +240,7 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         int before = records.size();
         AccessibilityNodeInfo groupToOpen = null;
         String groupTitle = null;
+        ArrayList<CoverTarget> coverTargets = new ArrayList<>();
 
         for (int i = 0; i < list.getChildCount(); i++) {
             AccessibilityNodeInfo row = list.getChild(i);
@@ -238,12 +257,19 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
                 // O cartão da temporada representa vários episódios; não o salvamos como filme.
                 continue;
             }
-            addRecord(info, "");
+            CapturedItem added = addRecord(info, "");
+            if (added != null) coverTargets.add(new CoverTarget(added, coverBoundsForRow(row)));
         }
 
         if (records.size() > before) {
             mainIdlePasses = 0;
             persistState(false);
+            if (!coverTargets.isEmpty()) {
+                captureVisibleCovers(coverTargets);
+                // Não rola/abre outra tela antes da captura do frame atual.
+                scheduleScan(520);
+                return;
+            }
         } else {
             mainIdlePasses++;
         }
@@ -290,6 +316,7 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         waitingPasses = 0;
 
         int before = records.size();
+        ArrayList<CoverTarget> coverTargets = new ArrayList<>();
         for (int i = 0; i < list.getChildCount(); i++) {
             AccessibilityNodeInfo row = list.getChild(i);
             if (row == null || !row.isVisibleToUser()) continue;
@@ -299,13 +326,19 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
             // Dentro da temporada cada cartão é um download individual. Exigimos tamanho,
             // porque ele será usado depois para associar o episódio à pasta hexadecimal correta.
             if (info.sizeBytes > 0 && !looksLikeHeaderOnly(info.title)) {
-                addRecord(info, activeGroupTitle);
+                CapturedItem added = addRecord(info, activeGroupTitle);
+                if (added != null) coverTargets.add(new CoverTarget(added, coverBoundsForRow(row)));
             }
         }
 
         if (records.size() > before) {
             detailIdlePasses = 0;
             persistState(false);
+            if (!coverTargets.isEmpty()) {
+                captureVisibleCovers(coverTargets);
+                scheduleScan(520);
+                return;
+            }
         } else {
             detailIdlePasses++;
         }
@@ -526,11 +559,97 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
         return s == null ? "" : s.replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
     }
 
-    private void addRecord(RowInfo info, String groupTitle) {
-        if (info == null || info.title == null || info.title.trim().isEmpty()) return;
+    private CapturedItem addRecord(RowInfo info, String groupTitle) {
+        if (info == null || info.title == null || info.title.trim().isEmpty()) return null;
         String signature = normalizeGroupKey(info.title) + "|" + info.sizeBytes;
-        if (!signatures.add(signature)) return;
-        records.add(new CapturedItem(info.title.trim(), info.sizeBytes, info.sizeText, groupTitle));
+        if (!signatures.add(signature)) return null;
+        CapturedItem item = new CapturedItem(info.title.trim(), info.sizeBytes, info.sizeText, groupTitle, "");
+        records.add(item);
+        return item;
+    }
+
+    private Rect coverBoundsForRow(AccessibilityNodeInfo row) {
+        Rect rowBounds = new Rect();
+        if (row != null) row.getBoundsInScreen(rowBounds);
+        Rect image = findImageBounds(row, rowBounds, 0);
+        if (image != null && image.width() > 20 && image.height() > 20) return image;
+
+        // Fallback para interfaces em Compose: o pôster fica à esquerda e normalmente é 2:3.
+        int h = Math.max(1, rowBounds.height());
+        int w = Math.min(rowBounds.width(), Math.round(h * 0.70f));
+        int insetY = Math.max(0, Math.round(h * 0.04f));
+        return new Rect(rowBounds.left, rowBounds.top + insetY,
+                rowBounds.left + Math.max(1, w), rowBounds.bottom - insetY);
+    }
+
+    private Rect findImageBounds(AccessibilityNodeInfo node, Rect rowBounds, int depth) {
+        if (node == null || depth > 8) return null;
+        Rect best = null;
+        long bestArea = 0;
+        CharSequence cls = node.getClassName();
+        String className = cls == null ? "" : cls.toString();
+        if (className.contains("ImageView") && node.isVisibleToUser()) {
+            Rect r = new Rect();
+            node.getBoundsInScreen(r);
+            if (Rect.intersects(r, rowBounds) && r.centerX() <= rowBounds.left + rowBounds.width() / 2) {
+                long area = (long) Math.max(0, r.width()) * Math.max(0, r.height());
+                if (area > 400) { best = r; bestArea = area; }
+            }
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            Rect child = findImageBounds(node.getChild(i), rowBounds, depth + 1);
+            if (child == null) continue;
+            long area = (long) child.width() * child.height();
+            if (area > bestArea) { best = child; bestArea = area; }
+        }
+        return best;
+    }
+
+    private void captureVisibleCovers(final List<CoverTarget> targets) {
+        if (targets == null || targets.isEmpty() || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return;
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
+                @Override public void onSuccess(ScreenshotResult result) {
+                    Bitmap hardware = null;
+                    Bitmap screen = null;
+                    try {
+                        hardware = Bitmap.wrapHardwareBuffer(result.getHardwareBuffer(), result.getColorSpace());
+                        if (hardware == null) return;
+                        screen = hardware.copy(Bitmap.Config.ARGB_8888, false);
+                        if (screen == null) return;
+                        File dir = new File(getFilesDir(), "captured_covers/session_" + loadedSession);
+                        if (!dir.exists()) dir.mkdirs();
+
+                        int idx = 0;
+                        for (CoverTarget target : targets) {
+                            Rect r = new Rect(target.bounds);
+                            r.left = Math.max(0, Math.min(r.left, screen.getWidth() - 1));
+                            r.top = Math.max(0, Math.min(r.top, screen.getHeight() - 1));
+                            r.right = Math.max(r.left + 1, Math.min(r.right, screen.getWidth()));
+                            r.bottom = Math.max(r.top + 1, Math.min(r.bottom, screen.getHeight()));
+                            if (r.width() < 20 || r.height() < 20) continue;
+
+                            Bitmap crop = Bitmap.createBitmap(screen, r.left, r.top, r.width(), r.height());
+                            Bitmap poster = Bitmap.createScaledBitmap(crop, 240, 360, true);
+                            String key = Integer.toHexString((target.item.title + "|" + target.item.sizeBytes).hashCode());
+                            File out = new File(dir, key + "_" + (idx++) + ".jpg");
+                            try (FileOutputStream fos = new FileOutputStream(out)) {
+                                poster.compress(Bitmap.CompressFormat.JPEG, 86, fos);
+                                target.item.coverPath = out.getAbsolutePath();
+                            } catch (Exception ignored) {}
+                            if (poster != crop) poster.recycle();
+                            crop.recycle();
+                        }
+                        persistState(false);
+                    } catch (Exception ignored) {
+                    } finally {
+                        try { result.getHardwareBuffer().close(); } catch (Exception ignored) {}
+                        if (screen != null) screen.recycle();
+                    }
+                }
+                @Override public void onFailure(int errorCode) { }
+            });
+        } catch (Exception ignored) {}
     }
 
     private void resetForNewSession(long session) {
@@ -571,6 +690,7 @@ public class OriginalTitleAccessibilityService extends AccessibilityService {
                 o.put("sizeBytes", item.sizeBytes);
                 o.put("sizeText", item.sizeText);
                 o.put("groupTitle", item.groupTitle);
+                o.put("coverPath", item.coverPath);
                 ra.put(o);
             } catch (Exception ignored) {}
         }

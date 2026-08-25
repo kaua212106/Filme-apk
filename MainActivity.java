@@ -1799,6 +1799,7 @@ public class MainActivity extends Activity {
 
             // Também guarda a relação estável código da pasta -> nome capturado no app original.
             root.put("originalMappings", OriginalAppBridge.exportSavedMappings(this));
+            root.put("originalCovers", OriginalAppBridge.exportSavedCovers(this));
 
             try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
                 if (out == null) throw new Exception("Não foi possível abrir o arquivo de destino.");
@@ -1833,6 +1834,7 @@ public class MainActivity extends Activity {
 
     private void restoreBackup(JSONObject root) throws Exception {
         int restoredOriginalMappings = OriginalAppBridge.importSavedMappings(this, root.optJSONObject("originalMappings"));
+        int restoredOriginalCovers = OriginalAppBridge.importSavedCovers(this, root.optJSONObject("originalCovers"));
         List<Movie> current = repo.getAll();
         Map<String, Movie> currentByKey = new HashMap<>();
         Map<Long, List<Movie>> currentByDuration = new HashMap<>();
@@ -1875,6 +1877,8 @@ public class MainActivity extends Activity {
             }
         }
         repo.saveAll(current);
+        // Reaplica também as capas salvas por código da pasta.
+        try { OriginalAppBridge.applySavedMappings(this, repo); } catch (Exception ignored) {}
 
         // Recria as séries do backup e depois liga cada episódio ao filme atual correspondente.
         for (SeriesRepository.SeriesInfo old : new ArrayList<>(seriesRepo.getAllSeries())) {
@@ -1917,7 +1921,8 @@ public class MainActivity extends Activity {
                 .setMessage(restoredNames + " item(ns) tiveram nomes/dados restaurados.\n" +
                         newSeriesIds.size() + " série(s) recriada(s).\n" +
                         restoredEpisodes + " episódio(s) reorganizado(s).\n" +
-                        restoredOriginalMappings + " associação(ões) do app original restaurada(s).")
+                        restoredOriginalMappings + " associação(ões) do app original restaurada(s).\n" +
+                        restoredOriginalCovers + " capa(s) restaurada(s).")
                 .setPositiveButton("OK", null)
                 .show();
     }
