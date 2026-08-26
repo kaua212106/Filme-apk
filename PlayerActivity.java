@@ -25,6 +25,7 @@ import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.ui.AspectRatioFrameLayout;
 import androidx.media3.ui.PlayerView;
 
 import java.io.File;
@@ -35,9 +36,13 @@ public class PlayerActivity extends Activity {
     private MovieRepository repo;
     private Movie movie;
     private PlayerView playerView;
+    private LinearLayout rootView;
     private LinearLayout topBar;
     private LinearLayout bottomBar;
     private TextView speedButton;
+    private TextView displayModeButton;
+    private int displayMode = 0;
+    private float displayZoom = 1.0f;
     private boolean started;
     private boolean fullscreen;
     private final Handler nextHandler = new Handler(Looper.getMainLooper());
@@ -70,10 +75,10 @@ public class PlayerActivity extends Activity {
     }
 
     private void buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.BLACK);
-        root.setPadding(0, statusBarHeight(), 0, 0);
+        rootView = new LinearLayout(this);
+        rootView.setOrientation(LinearLayout.VERTICAL);
+        rootView.setBackgroundColor(Color.BLACK);
+        rootView.setPadding(0, statusBarHeight(), 0, 0);
 
         topBar = new LinearLayout(this);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
@@ -98,10 +103,15 @@ public class PlayerActivity extends Activity {
         speedButton.setOnClickListener(v -> chooseSpeed());
         topBar.addView(speedButton, new LinearLayout.LayoutParams(dp(56), dp(44)));
 
+        displayModeButton = control("▣", 20);
+        displayModeButton.setContentDescription("Formato da imagem");
+        displayModeButton.setOnClickListener(v -> chooseDisplayMode());
+        topBar.addView(displayModeButton, new LinearLayout.LayoutParams(dp(50), dp(44)));
+
         TextView rotate = control("↻", 23);
         rotate.setOnClickListener(v -> rotateScreen());
         topBar.addView(rotate, new LinearLayout.LayoutParams(dp(50), dp(44)));
-        root.addView(topBar);
+        rootView.addView(topBar);
 
         playerView = new PlayerView(this);
         playerView.setUseController(true);
@@ -111,7 +121,8 @@ public class PlayerActivity extends Activity {
         playerView.setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING);
         playerView.setKeepContentOnPlayerReset(true);
         playerView.setBackgroundColor(Color.BLACK);
-        root.addView(playerView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
+        rootView.addView(playerView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
         bottomBar = new LinearLayout(this);
         bottomBar.setGravity(Gravity.CENTER);
@@ -133,9 +144,9 @@ public class PlayerActivity extends Activity {
         TextView forward = pill("10 s ↷");
         forward.setOnClickListener(v -> seekBy(10_000));
         bottomBar.addView(forward, weighted());
-        root.addView(bottomBar);
+        rootView.addView(bottomBar);
 
-        setContentView(root);
+        setContentView(rootView);
     }
 
     private LinearLayout.LayoutParams weighted() {
@@ -259,6 +270,100 @@ public class PlayerActivity extends Activity {
         player.seekTo(target);
     }
 
+
+    private void chooseDisplayMode() {
+        String[] options = {
+                "Ajustar — mostrar a imagem inteira",
+                "Preencher — ocupar toda a tela",
+                "Zoom 110%",
+                "Zoom 125%",
+                "Zoom 140%",
+                "Zoom 160%"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Formato da imagem")
+                .setSingleChoiceItems(options, displayModeChoiceIndex(), (dialog, which) -> {
+                    switch (which) {
+                        case 0:
+                            applyDisplayMode(0, 1.0f);
+                            break;
+                        case 1:
+                            applyDisplayMode(1, 1.0f);
+                            break;
+                        case 2:
+                            applyDisplayMode(2, 1.10f);
+                            break;
+                        case 3:
+                            applyDisplayMode(2, 1.25f);
+                            break;
+                        case 4:
+                            applyDisplayMode(2, 1.40f);
+                            break;
+                        case 5:
+                            applyDisplayMode(2, 1.60f);
+                            break;
+                    }
+                    dialog.dismiss();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private int displayModeChoiceIndex() {
+        if (displayMode == 0) return 0;
+        if (displayMode == 1) return 1;
+        if (displayZoom < 1.18f) return 2;
+        if (displayZoom < 1.33f) return 3;
+        if (displayZoom < 1.50f) return 4;
+        return 5;
+    }
+
+    private void applyDisplayMode(int mode, float zoom) {
+        if (playerView == null) return;
+        displayMode = mode;
+        displayZoom = Math.max(1.0f, zoom);
+
+        View videoSurface = playerView.getVideoSurfaceView();
+        if (videoSurface != null) {
+            videoSurface.setScaleX(1.0f);
+            videoSurface.setScaleY(1.0f);
+        }
+
+        if (mode == 0) {
+            // Mantém 100% da imagem, sem deformar. Barras podem aparecer quando
+            // a proporção do filme é diferente da tela do aparelho.
+            playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
+            if (displayModeButton != null) {
+                displayModeButton.setText("▣");
+                displayModeButton.setContentDescription("Ajustar imagem");
+            }
+            return;
+        }
+
+        // ZOOM preserva a proporção e preenche o espaço, cortando somente as
+        // extremidades necessárias. É diferente de FILL, que esticaria a imagem.
+        playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
+
+        if (mode == 1) {
+            if (displayModeButton != null) {
+                displayModeButton.setText("▰");
+                displayModeButton.setContentDescription("Preencher tela");
+            }
+            return;
+        }
+
+        // Alguns downloads já trazem faixas pretas gravadas dentro do próprio
+        // vídeo. Nesses casos, um zoom extra consegue recortá-las.
+        if (videoSurface != null) {
+            videoSurface.setScaleX(displayZoom);
+            videoSurface.setScaleY(displayZoom);
+        }
+        if (displayModeButton != null) {
+            displayModeButton.setText("🔍");
+            displayModeButton.setContentDescription("Zoom " + Math.round(displayZoom * 100f) + "%");
+        }
+    }
+
     private void chooseSpeed() {
         if (player == null) return;
         String[] labels = {"0,5×", "0,75×", "1×", "1,25×", "1,5×", "1,75×", "2×"};
@@ -286,6 +391,7 @@ public class PlayerActivity extends Activity {
         if (fullscreen) {
             topBar.setVisibility(View.GONE);
             bottomBar.setVisibility(View.GONE);
+            if (rootView != null) rootView.setPadding(0, 0, 0, 0);
             decor.setSystemUiVisibility(
                     View.SYSTEM_UI_FLAG_FULLSCREEN |
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
@@ -296,6 +402,7 @@ public class PlayerActivity extends Activity {
         } else {
             topBar.setVisibility(View.VISIBLE);
             bottomBar.setVisibility(View.VISIBLE);
+            if (rootView != null) rootView.setPadding(0, statusBarHeight(), 0, 0);
             decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
         }
     }
